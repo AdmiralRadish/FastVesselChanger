@@ -1,0 +1,21 @@
+# Visual Studio
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.userosscache
+*.user
+*s.md
+
+# Build outputs
+bin/
+obj/
+GameData/
+
+# Rider
+.idea/
+.vs/
+
+LUNAMULTIPLAYER.md
+*.htm
+NuGet.config

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!-- 
+    KSPBuildTools Configuration - Copy this block to your .csproj.user file
+    and update KSPBT_GameRoot to point to your KSP installation directory
+    (the directory that contains "GameData")
+  -->
+  <PropertyGroup>
+    <!-- Update this path to your KSP installation directory -->
+    <KSPBT_GameRoot>C:\Path\To\Your\KSP\Installation</KSPBT_GameRoot>
+    <!-- Or use ReferencePath as an alternative -->
+    <!-- <ReferencePath>C:\Path\To\Your\KSP\Installation\KSP_x64_Data\Managed</ReferencePath> -->
+  </PropertyGroup>
+</Project>
