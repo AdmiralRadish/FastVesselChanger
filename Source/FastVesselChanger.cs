@@ -729,76 +729,9 @@ public class FastVesselChanger : MonoBehaviour
     {
         GUILayout.BeginVertical();
 
-        // ---- Auto Switch Controls ----
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Interval (s):", GUILayout.Width(80));
-        switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(55));
-        int parsed;
-        if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
-        {
-            double effectiveInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
-            double remaining = Math.Max(0, effectiveInterval - (Planetarium.GetUniversalTime() - lastSwitchTime));
-            if (!autoEnabled || parsed >= remaining)
-            {
-                switchInterval = parsed;
-                pendingInterval = -1;
-            }
-            else
-            {
-                pendingInterval = parsed;
-            }
-        }
-        if (pendingInterval > 0)
-            GUILayout.Label("(pending)", GUILayout.ExpandWidth(false));
-        GUILayout.EndHorizontal();
-
-        GUILayout.BeginHorizontal();
-        if (GUILayout.Button(autoEnabled ? "Stop Auto" : "Start Auto", GUILayout.Width(100)))
-        {
-            ToggleAuto();
-        }
-        if (GUILayout.Button("Next Now", GUILayout.Width(90)))
-        {
-            double ut = Planetarium.GetUniversalTime();
-            double timeSinceLastSwitch = ut - lastSwitchTime;
-            if (timeSinceLastSwitch >= MINIMUM_SWITCH_INTERVAL)
-            {
-                SwitchToNext();
-                lastSwitchTime = ut;
-            }
-            else
-            {
-                double timeRemaining = Math.Round(MINIMUM_SWITCH_INTERVAL - timeSinceLastSwitch, 1);
-                ScreenMessages.PostScreenMessage("Wait " + timeRemaining + " more seconds before switching", 3f, ScreenMessageStyle.UPPER_CENTER);
-            }
-        }
-        if (GUILayout.Button("Refresh List", GUILayout.Width(90)))
-        {
-            RefreshSelectionsFromVessels();
-        }
-        GUILayout.EndHorizontal();
-
-        if (autoEnabled)
-        {
-            double effectiveInterval2 = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
-            double remaining2 = Math.Max(0, effectiveInterval2 - (Planetarium.GetUniversalTime() - lastSwitchTime));
-            GUILayout.Label("Next switch in: " + remaining2.ToString("F0") + "s");
-        }
-
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Flight UI: " + (userPreferredUIVisible ? "VISIBLE" : "HIDDEN"), GUILayout.Width(120));
-        if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(120)))
-        {
-            userPreferredUIVisible = !userPreferredUIVisible;
-            ToggleFlightHUD();
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-
-        GUILayout.Space(6);
-
         // ---- Vessel Type Filter ----
-        showTypeFilter = GUILayout.Toggle(showTypeFilter, "  Vessel Type Filter");
+        if (GUILayout.Button((showTypeFilter ? "[-] " : "[+] ") + "Vessel Type Filter"))
+            showTypeFilter = !showTypeFilter;
         if (showTypeFilter)
         {
             GUILayout.BeginVertical("box");
@@ -828,23 +761,7 @@ public class FastVesselChanger : MonoBehaviour
 
         // ---- Vessel List ----
         int selectedCount = selected.Values.Count(v => v);
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Vessels (" + selectedCount + " selected):", GUILayout.Width(180));
-        if (GUILayout.Button("All", GUILayout.Width(38)))
-        {
-            foreach (var v in FlightGlobals.Vessels.Where(v => v != null && IsVesselTypeEnabled(v.vesselType.ToString())))
-                selected[v.id] = true;
-            SaveToScenario();
-            BuildCycleList();
-        }
-        if (GUILayout.Button("None", GUILayout.Width(44)))
-        {
-            foreach (var key in selected.Keys.ToList())
-                selected[key] = false;
-            SaveToScenario();
-            BuildCycleList();
-        }
-        GUILayout.EndHorizontal();
+        GUILayout.Label("Vessels (" + selectedCount + " selected):");
 
         // Search bar
         GUILayout.BeginHorizontal();
@@ -904,13 +821,85 @@ public class FastVesselChanger : MonoBehaviour
 
         GUILayout.EndScrollView();
 
+        // Divider between vessel list and controls area.
+        GUILayout.Space(4);
+        GUILayout.Box("", GUILayout.Height(1), GUILayout.ExpandWidth(true));
         GUILayout.Space(6);
 
         // ---- Camera Controls ----
-        showCameraControls = GUILayout.Toggle(showCameraControls, "  Camera Controls");
+        if (GUILayout.Button((showCameraControls ? "[-] " : "[+] ") + "Camera Controls"))
+            showCameraControls = !showCameraControls;
         if (showCameraControls)
         {
             GUILayout.BeginVertical("box");
+
+            // ---- Auto Switch Controls ----
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Interval (s):", GUILayout.Width(80));
+            switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(55));
+            int parsed;
+            if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
+            {
+                double effectiveInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+                double remaining = Math.Max(0, effectiveInterval - (Planetarium.GetUniversalTime() - lastSwitchTime));
+                if (!autoEnabled || parsed >= remaining)
+                {
+                    switchInterval = parsed;
+                    pendingInterval = -1;
+                }
+                else
+                {
+                    pendingInterval = parsed;
+                }
+            }
+            if (pendingInterval > 0)
+                GUILayout.Label("(pending)", GUILayout.ExpandWidth(false));
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button(autoEnabled ? "Stop Auto" : "Start Auto", GUILayout.Width(100)))
+            {
+                ToggleAuto();
+            }
+            if (GUILayout.Button("Next Now", GUILayout.Width(90)))
+            {
+                double ut = Planetarium.GetUniversalTime();
+                double timeSinceLastSwitch = ut - lastSwitchTime;
+                if (timeSinceLastSwitch >= MINIMUM_SWITCH_INTERVAL)
+                {
+                    SwitchToNext();
+                    lastSwitchTime = ut;
+                }
+                else
+                {
+                    double timeRemaining = Math.Round(MINIMUM_SWITCH_INTERVAL - timeSinceLastSwitch, 1);
+                    ScreenMessages.PostScreenMessage("Wait " + timeRemaining + " more seconds before switching", 3f, ScreenMessageStyle.UPPER_CENTER);
+                }
+            }
+            if (GUILayout.Button("Refresh List", GUILayout.Width(90)))
+            {
+                RefreshSelectionsFromVessels();
+            }
+            GUILayout.EndHorizontal();
+
+            if (autoEnabled)
+            {
+                double effectiveInterval2 = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+                double remaining2 = Math.Max(0, effectiveInterval2 - (Planetarium.GetUniversalTime() - lastSwitchTime));
+                GUILayout.Label("Next switch in: " + remaining2.ToString("F0") + "s");
+            }
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Flight UI: " + (userPreferredUIVisible ? "VISIBLE" : "HIDDEN"), GUILayout.Width(120));
+            if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(120)))
+            {
+                userPreferredUIVisible = !userPreferredUIVisible;
+                ToggleFlightHUD();
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(6);
 
             GUILayout.BeginHorizontal();
             GUILayout.Label("Auto Rotation: " + (cameraRotEnabled ? "ON" : "OFF"), GUILayout.Width(150));
