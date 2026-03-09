@@ -2,7 +2,7 @@
     "spec_version"   : 1,
     "identifier"     : "FastVesselChanger",
     "name"           : "Fast Vessel Changer",
-    "abstract"       : "Automatically cycle through selected vessels with customizable intervals.",
+    "abstract"       : "Quickly Cycle through selected vessels with timer-based switching, type filters, and quick in-flight controls.",
     "$kref"          : "#/ckan/github/AdmiralRadish/FastVesselChanger",
     "license"        : "MIT",
     "author"         : "NickAdmiralRadish",

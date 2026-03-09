@@ -1,8 +1,8 @@
 {
   "name": "Fast Vessel Changer",
   "identifier": "FastVesselChanger",
-  "abstract": "Automatically cycles through selected vessels with customizable intervals",
-  "description": "A minimal Kerbal Space Program camera toggle plugin that automatically switches between selected vessels. Features include customizable switch intervals, per-player settings for LunaMultiplayer servers, and selective vessel filtering by type.",
+  "abstract": "Cycle through selected vessels with timer-based switching and in-flight controls",
+  "description": "FastVesselChanger adds a flight window for cycling between selected vessels on a configurable timer, with one-click Next/Refresh controls, vessel-type filtering, and per-vessel selection. It also includes optional camera rotation and zoom tracking, plus per-player saved settings when LunaMultiplayer is present.",
   "author": "AdmiralRadish",
   "version": "1.0.0",
   "ksp_version_min": "1.8",
