@@ -10,12 +10,14 @@
 # Build outputs
 bin/
 obj/
-GameData/
+GameData/CameraSwitcherAuto
 
 # Rider
 .idea/
 .vs/
 
+*.dll
 LUNAMULTIPLAYER.md
+*_*.md
 *.htm
 NuGet.config

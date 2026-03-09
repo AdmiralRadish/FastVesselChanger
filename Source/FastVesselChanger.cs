@@ -91,7 +91,7 @@ public static class LunaMultiplayerHelper
                                 if (!string.IsNullOrEmpty(playerName))
                                 {
                                     _cachedPlayerName = SanitizePlayerName(playerName);
-                                    Debug.Log("[CameraSwitcherAuto] Detected Luna player: " + _cachedPlayerName);
+                                    Debug.Log("[FastVesselChanger] Detected Luna player: " + _cachedPlayerName);
                                     return _cachedPlayerName;
                                 }
                             }
@@ -102,7 +102,7 @@ public static class LunaMultiplayerHelper
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] Error detecting Luna player name: " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] Error detecting Luna player name: " + e.Message);
         }
 
         // Fallback to single-player mode
@@ -144,7 +144,7 @@ public static class LunaMultiplayerHelper
 // Persistence scenario module stores settings in the KSP save under SCENARIO
 // Supports both single-player and LunaMultiplayer servers with per-player settings
 [KSPScenario(ScenarioCreationOptions.AddToAllGames, GameScenes.FLIGHT)]
-public class CameraSwitcherScenario : ScenarioModule
+public class FastVesselChangerScenario : ScenarioModule
 {
     public int switchInterval = 300;
     public bool autoEnabled = false;
@@ -158,7 +158,7 @@ public class CameraSwitcherScenario : ScenarioModule
     public List<string> selectedVesselIds = new List<string>();
     public List<string> selectedVesselTypes = new List<string>();
 
-    public static CameraSwitcherScenario Instance { get; private set; }
+    public static FastVesselChangerScenario Instance { get; private set; }
 
     /// <summary>
     /// Get the current player identifier for scenario storage
@@ -214,11 +214,11 @@ public class CameraSwitcherScenario : ScenarioModule
                 node.AddValue(vesselTypePrefix, type);
             }
 
-            Debug.Log("[CameraSwitcherAuto] Saved settings for player: " + playerPrefix);
+            Debug.Log("[FastVesselChanger] Saved settings for player: " + playerPrefix);
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] Scenario OnSave error: " + e.Message);
+            Debug.LogError("[FastVesselChanger] Scenario OnSave error: " + e.Message);
         }
     }
 
@@ -282,12 +282,12 @@ public class CameraSwitcherScenario : ScenarioModule
                 if (!string.IsNullOrEmpty(t)) selectedVesselTypes.Add(t);
             }
 
-            Debug.Log("[CameraSwitcherAuto] Loaded settings for player: " + playerPrefix + 
+            Debug.Log("[FastVesselChanger] Loaded settings for player: " + playerPrefix + 
                      " (vessels: " + selectedVesselIds.Count + ", types: " + selectedVesselTypes.Count + ")");
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] Scenario OnLoad error: " + e.Message);
+            Debug.LogError("[FastVesselChanger] Scenario OnLoad error: " + e.Message);
         }
     }
 
@@ -331,7 +331,7 @@ public static class PersistenceHelpers
 }
 
 [KSPAddon(KSPAddon.Startup.Flight, false)]
-public class CameraSwitcherAuto : MonoBehaviour
+public class FastVesselChanger : MonoBehaviour
 {
     // Minimum time (seconds) between any two switches to prevent rapid switching
     private const double MINIMUM_SWITCH_INTERVAL = 10.0;
@@ -344,6 +344,9 @@ public class CameraSwitcherAuto : MonoBehaviour
     private bool showWindow = true;
     private bool showTypeFilter = false; // Toggle for vessel type filter section
     private bool lastShowTypeFilter = false; // Track previous state to detect changes
+    private bool showCameraControls = true; // Toggle for camera controls section
+    private bool lastShowCameraControls = true; // Track previous state to detect changes
+    private string vesselSearchText = ""; // Live search filter for vessel list
 
     private Dictionary<Guid, bool> selected = new Dictionary<Guid, bool>();
     private Dictionary<string, bool> vesselTypeFilter = new Dictionary<string, bool>(); // Vessel type filtering
@@ -395,7 +398,7 @@ public class CameraSwitcherAuto : MonoBehaviour
 
     void Start()
     {
-        Debug.Log("[CameraSwitcherAuto] started");
+        Debug.Log("[FastVesselChanger] started");
         
         // Initialize lastSwitchTime to prevent premature switching on startup
         lastSwitchTime = Planetarium.GetUniversalTime();
@@ -403,13 +406,13 @@ public class CameraSwitcherAuto : MonoBehaviour
         // Log multiplayer status
         if (LunaMultiplayerHelper.IsLunaEnabled)
         {
-            Debug.Log("[CameraSwitcherAuto] LunaMultiplayer detected - using per-player settings");
+            Debug.Log("[FastVesselChanger] LunaMultiplayer detected - using per-player settings");
             string playerName = LunaMultiplayerHelper.GetCurrentPlayerName();
-            Debug.Log("[CameraSwitcherAuto] Current player: " + playerName);
+            Debug.Log("[FastVesselChanger] Current player: " + playerName);
         }
         else
         {
-            Debug.Log("[CameraSwitcherAuto] Single-player mode");
+            Debug.Log("[FastVesselChanger] Single-player mode");
         }
 
         InitializeVesselTypeFilter();
@@ -418,7 +421,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         // Load persisted settings if scenario exists
         try
         {
-            var scen = CameraSwitcherScenario.Instance;
+            var scen = FastVesselChangerScenario.Instance;
             if (scen != null)
             {
                 switchInterval = scen.switchInterval;
@@ -456,7 +459,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] Error loading scenario data: " + e.Message);
+            Debug.LogError("[FastVesselChanger] Error loading scenario data: " + e.Message);
         }
 
         // If a vessel switch produced randomized rates, apply them now — after scenario load,
@@ -507,15 +510,15 @@ public class CameraSwitcherAuto : MonoBehaviour
                 _uiHideMethod = t.GetMethod("HideUI", BindingFlags.Public | BindingFlags.Instance);
                 _uiShowMethod = t.GetMethod("ShowUI", BindingFlags.Public | BindingFlags.Instance);
 
-                Debug.Log("[CameraSwitcherAuto] UIMasterController found: HideUI=" + (_uiHideMethod != null) + ", ShowUI=" + (_uiShowMethod != null));
+                Debug.Log("[FastVesselChanger] UIMasterController found: HideUI=" + (_uiHideMethod != null) + ", ShowUI=" + (_uiShowMethod != null));
                 break;
             }
             if (_uiMasterInstance == null)
-                Debug.LogWarning("[CameraSwitcherAuto] UIMasterController.Instance not found — falling back to event firing");
+                Debug.LogWarning("[FastVesselChanger] UIMasterController.Instance not found — falling back to event firing");
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] CacheUIMasterController failed: " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] CacheUIMasterController failed: " + e.Message);
         }
     }
 
@@ -530,7 +533,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         if (_uiMasterInstance != null && _uiHideMethod != null)
         {
             try { _uiHideMethod.Invoke(_uiMasterInstance, null); }
-            catch (Exception e) { Debug.LogWarning("[CameraSwitcherAuto] UIMasterController.HideUI() failed: " + e.Message); }
+            catch (Exception e) { Debug.LogWarning("[FastVesselChanger] UIMasterController.HideUI() failed: " + e.Message); }
         }
         GameEvents.onHideUI.Fire();
     }
@@ -547,7 +550,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             }
             catch (Exception e)
             {
-                Debug.LogWarning("[CameraSwitcherAuto] UIMasterController.ShowUI() failed: " + e.Message);
+                Debug.LogWarning("[FastVesselChanger] UIMasterController.ShowUI() failed: " + e.Message);
             }
         }
         GameEvents.onShowUI.Fire();
@@ -654,12 +657,12 @@ public class CameraSwitcherAuto : MonoBehaviour
                         // First time: log all distance-related float fields so we can verify the right name
                         foreach (var f in cam.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                             if (f.FieldType == typeof(float) && f.Name.ToLower().Contains("dist"))
-                                Debug.Log("[CameraSwitcherAuto] FlightCamera float field: " + f.Name + " = " + f.GetValue(cam));
+                                Debug.Log("[FastVesselChanger] FlightCamera float field: " + f.Name + " = " + f.GetValue(cam));
                     }
 
                     // Log on the very first frame so we can see what's available
                     if (_zoomRestoreFrames == 240)
-                        Debug.Log("[CameraSwitcherAuto] RestoreZoom start: target=" + _pendingZoom
+                        Debug.Log("[FastVesselChanger] RestoreZoom start: target=" + _pendingZoom
                             + " current=" + cam.Distance
                             + " camDistField=" + (_camDistField != null ? _camDistField.Name : "NOT FOUND"));
 
@@ -668,7 +671,7 @@ public class CameraSwitcherAuto : MonoBehaviour
                     _zoomRestoreFrames--;
                     if (_zoomRestoreFrames == 0)
                     {
-                        Debug.Log("[CameraSwitcherAuto] RestoreZoom done: final Distance=" + cam.Distance);
+                        Debug.Log("[FastVesselChanger] RestoreZoom done: final Distance=" + cam.Distance);
                         _pendingZoomVesselId = Guid.Empty;
                     }
                 }
@@ -676,7 +679,7 @@ public class CameraSwitcherAuto : MonoBehaviour
                 {
                     // cam null — decrement so we don't stall forever, log once
                     if (_zoomRestoreFrames == 240)
-                        Debug.LogWarning("[CameraSwitcherAuto] RestoreZoom: FlightCamera.fetch is null on frame 240");
+                        Debug.LogWarning("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null on frame 240");
                     _zoomRestoreFrames--;
                 }
             }
@@ -710,14 +713,15 @@ public class CameraSwitcherAuto : MonoBehaviour
     {
         if (!showWindow) return;
         
-        // Force window height recalculation when filter visibility changes
-        if (showTypeFilter != lastShowTypeFilter)
+        // Force window height recalculation when collapsible sections change
+        if (showTypeFilter != lastShowTypeFilter || showCameraControls != lastShowCameraControls)
         {
             windowRect.height = 0; // Reset height to force GUILayout recalculation
             lastShowTypeFilter = showTypeFilter;
+            lastShowCameraControls = showCameraControls;
         }
         
-        windowRect = GUILayout.Window(GetInstanceID(), windowRect, DrawWindow, "Camera Switcher Auto",
+        windowRect = GUILayout.Window(GetInstanceID(), windowRect, DrawWindow, "Fast Vessel Changer",
             GUILayout.Width(FIXED_WINDOW_WIDTH));
     }
 
@@ -725,9 +729,10 @@ public class CameraSwitcherAuto : MonoBehaviour
     {
         GUILayout.BeginVertical();
 
+        // ---- Auto Switch Controls ----
         GUILayout.BeginHorizontal();
-        GUILayout.Label("Switch interval (seconds):", GUILayout.Width(160));
-        switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(60));
+        GUILayout.Label("Interval (s):", GUILayout.Width(80));
+        switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(55));
         int parsed;
         if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
         {
@@ -744,7 +749,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             }
         }
         if (pendingInterval > 0)
-            GUILayout.Label("(pending)", GUILayout.Width(60));
+            GUILayout.Label("(pending)", GUILayout.ExpandWidth(false));
         GUILayout.EndHorizontal();
 
         GUILayout.BeginHorizontal();
@@ -752,11 +757,10 @@ public class CameraSwitcherAuto : MonoBehaviour
         {
             ToggleAuto();
         }
-        if (GUILayout.Button("Next Now", GUILayout.Width(100)))
+        if (GUILayout.Button("Next Now", GUILayout.Width(90)))
         {
             double ut = Planetarium.GetUniversalTime();
             double timeSinceLastSwitch = ut - lastSwitchTime;
-            
             if (timeSinceLastSwitch >= MINIMUM_SWITCH_INTERVAL)
             {
                 SwitchToNext();
@@ -768,7 +772,7 @@ public class CameraSwitcherAuto : MonoBehaviour
                 ScreenMessages.PostScreenMessage("Wait " + timeRemaining + " more seconds before switching", 3f, ScreenMessageStyle.UPPER_CENTER);
             }
         }
-        if (GUILayout.Button("Refresh List", GUILayout.Width(100)))
+        if (GUILayout.Button("Refresh List", GUILayout.Width(90)))
         {
             RefreshSelectionsFromVessels();
         }
@@ -776,15 +780,14 @@ public class CameraSwitcherAuto : MonoBehaviour
 
         if (autoEnabled)
         {
-            double effectiveInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
-            double remaining = Math.Max(0, effectiveInterval - (Planetarium.GetUniversalTime() - lastSwitchTime));
-            GUILayout.Label("Next switch in: " + remaining.ToString("F0") + "s");
+            double effectiveInterval2 = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+            double remaining2 = Math.Max(0, effectiveInterval2 - (Planetarium.GetUniversalTime() - lastSwitchTime));
+            GUILayout.Label("Next switch in: " + remaining2.ToString("F0") + "s");
         }
 
         GUILayout.BeginHorizontal();
-        // Show the user's preferred UI state (not the current detected state)
         GUILayout.Label("Flight UI: " + (userPreferredUIVisible ? "VISIBLE" : "HIDDEN"), GUILayout.Width(120));
-        if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(100)))
+        if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(120)))
         {
             userPreferredUIVisible = !userPreferredUIVisible;
             ToggleFlightHUD();
@@ -792,98 +795,10 @@ public class CameraSwitcherAuto : MonoBehaviour
         }
         GUILayout.EndHorizontal();
 
-        GUILayout.Space(4);
+        GUILayout.Space(6);
 
-        // Camera auto-rotation controls
-        GUILayout.BeginVertical("box");
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Camera Rotation: " + (cameraRotEnabled ? "ON" : "OFF"), GUILayout.Width(150));
-        if (GUILayout.Button(cameraRotEnabled ? "Disable" : "Enable", GUILayout.Width(70)))
-        {
-            cameraRotEnabled = !cameraRotEnabled;
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Random rates on switch:", GUILayout.Width(150));
-        if (GUILayout.Button(cameraRotRandomEnabled ? "ON" : "OFF", GUILayout.Width(40)))
-        {
-            cameraRotRandomEnabled = !cameraRotRandomEnabled;
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Zoom tracking:", GUILayout.Width(150));
-        if (GUILayout.Button(zoomTrackingEnabled ? "ON" : "OFF", GUILayout.Width(40)))
-        {
-            zoomTrackingEnabled = !zoomTrackingEnabled;
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-
-        // Pitch (X) row
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Pitch (X) °/s:", GUILayout.Width(90));
-        if (GUILayout.Button("-", GUILayout.Width(22)))
-        {
-            cameraRotXRate = (float)Math.Round(cameraRotXRate - 1f, 1);
-            cameraRotXText = cameraRotXRate.ToString("F1");
-            SaveToScenario();
-        }
-        string newXText = GUILayout.TextField(cameraRotXText, GUILayout.Width(50));
-        if (newXText != cameraRotXText)
-        {
-            cameraRotXText = newXText;
-            float xParsed;
-            if (float.TryParse(cameraRotXText, out xParsed))
-            {
-                cameraRotXRate = xParsed;
-                SaveToScenario();
-            }
-        }
-        if (GUILayout.Button("+", GUILayout.Width(22)))
-        {
-            cameraRotXRate = (float)Math.Round(cameraRotXRate + 1f, 1);
-            cameraRotXText = cameraRotXRate.ToString("F1");
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-
-        // Orbit (Y) row
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Orbit (Y) °/s:", GUILayout.Width(90));
-        if (GUILayout.Button("-", GUILayout.Width(22)))
-        {
-            cameraRotYRate = (float)Math.Round(cameraRotYRate - 1f, 1);
-            cameraRotYText = cameraRotYRate.ToString("F1");
-            SaveToScenario();
-        }
-        string newYText = GUILayout.TextField(cameraRotYText, GUILayout.Width(50));
-        if (newYText != cameraRotYText)
-        {
-            cameraRotYText = newYText;
-            float yParsed;
-            if (float.TryParse(cameraRotYText, out yParsed))
-            {
-                cameraRotYRate = yParsed;
-                SaveToScenario();
-            }
-        }
-        if (GUILayout.Button("+", GUILayout.Width(22)))
-        {
-            cameraRotYRate = (float)Math.Round(cameraRotYRate + 1f, 1);
-            cameraRotYText = cameraRotYRate.ToString("F1");
-            SaveToScenario();
-        }
-        GUILayout.EndHorizontal();
-        GUILayout.EndVertical();
-
-        GUILayout.Space(8);
-
-        // Vessel Type Filter Section
-        showTypeFilter = GUILayout.Toggle(showTypeFilter, "Vessel Type Filter");
+        // ---- Vessel Type Filter ----
+        showTypeFilter = GUILayout.Toggle(showTypeFilter, "  Vessel Type Filter");
         if (showTypeFilter)
         {
             GUILayout.BeginVertical("box");
@@ -909,17 +824,46 @@ public class CameraSwitcherAuto : MonoBehaviour
             GUILayout.EndVertical();
         }
 
-        GUILayout.Space(6);
-        GUILayout.Label("Select vessels to include:");
+        GUILayout.Space(4);
+
+        // ---- Vessel List ----
+        int selectedCount = selected.Values.Count(v => v);
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Vessels (" + selectedCount + " selected):", GUILayout.Width(180));
+        if (GUILayout.Button("All", GUILayout.Width(38)))
+        {
+            foreach (var v in FlightGlobals.Vessels.Where(v => v != null && IsVesselTypeEnabled(v.vesselType.ToString())))
+                selected[v.id] = true;
+            SaveToScenario();
+            BuildCycleList();
+        }
+        if (GUILayout.Button("None", GUILayout.Width(44)))
+        {
+            foreach (var key in selected.Keys.ToList())
+                selected[key] = false;
+            SaveToScenario();
+            BuildCycleList();
+        }
+        GUILayout.EndHorizontal();
+
+        // Search bar
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Search:", GUILayout.Width(50));
+        vesselSearchText = GUILayout.TextField(vesselSearchText, GUILayout.ExpandWidth(true));
+        if (!string.IsNullOrEmpty(vesselSearchText) && GUILayout.Button("X", GUILayout.Width(24)))
+            vesselSearchText = "";
+        GUILayout.EndHorizontal();
+
         scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.Height(BASE_SCROLL_HEIGHT));
-        
+
+        string searchLower = vesselSearchText.ToLowerInvariant();
+        bool anyVisible = false;
         foreach (Vessel v in FlightGlobals.Vessels.Where(v => v != null).OrderBy(v => v.vesselName))
         {
-            
-            // Skip vessels that don't match type filter
-            if (!IsVesselTypeEnabled(v.vesselType.ToString()))
-                continue;
+            if (!IsVesselTypeEnabled(v.vesselType.ToString())) continue;
+            if (!string.IsNullOrEmpty(vesselSearchText) && !v.vesselName.ToLowerInvariant().Contains(searchLower)) continue;
 
+            anyVisible = true;
             bool prev = false;
             if (!selected.TryGetValue(v.id, out prev))
             {
@@ -950,15 +894,111 @@ public class CameraSwitcherAuto : MonoBehaviour
                 }
                 SwitchToVessel(v);
                 lastSwitchedVesselId = v.id;
-                lastSwitchTime = Planetarium.GetUniversalTime(); // reset timer
-                // Remove from shuffle bag so it's treated as already visited this round
+                lastSwitchTime = Planetarium.GetUniversalTime();
                 shuffleRemaining.RemoveAll(sv => sv != null && sv.id == v.id);
             }
             GUILayout.EndHorizontal();
         }
+        if (!anyVisible)
+            GUILayout.Label(string.IsNullOrEmpty(vesselSearchText) ? "No vessels match the active type filter." : "No vessels match \"" + vesselSearchText + "\".");
+
         GUILayout.EndScrollView();
 
         GUILayout.Space(6);
+
+        // ---- Camera Controls ----
+        showCameraControls = GUILayout.Toggle(showCameraControls, "  Camera Controls");
+        if (showCameraControls)
+        {
+            GUILayout.BeginVertical("box");
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Auto Rotation: " + (cameraRotEnabled ? "ON" : "OFF"), GUILayout.Width(150));
+            if (GUILayout.Button(cameraRotEnabled ? "Disable" : "Enable", GUILayout.Width(70)))
+            {
+                cameraRotEnabled = !cameraRotEnabled;
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Random rates on switch:", GUILayout.Width(150));
+            if (GUILayout.Button(cameraRotRandomEnabled ? "ON" : "OFF", GUILayout.Width(40)))
+            {
+                cameraRotRandomEnabled = !cameraRotRandomEnabled;
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Zoom tracking:", GUILayout.Width(150));
+            if (GUILayout.Button(zoomTrackingEnabled ? "ON" : "OFF", GUILayout.Width(40)))
+            {
+                zoomTrackingEnabled = !zoomTrackingEnabled;
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            // Pitch (X) row
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Pitch (X) deg/s:", GUILayout.Width(105));
+            if (GUILayout.Button("-", GUILayout.Width(22)))
+            {
+                cameraRotXRate = (float)Math.Round(cameraRotXRate - 1f, 1);
+                cameraRotXText = cameraRotXRate.ToString("F1");
+                SaveToScenario();
+            }
+            string newXText = GUILayout.TextField(cameraRotXText, GUILayout.Width(50));
+            if (newXText != cameraRotXText)
+            {
+                cameraRotXText = newXText;
+                float xParsed;
+                if (float.TryParse(cameraRotXText, out xParsed))
+                {
+                    cameraRotXRate = xParsed;
+                    SaveToScenario();
+                }
+            }
+            if (GUILayout.Button("+", GUILayout.Width(22)))
+            {
+                cameraRotXRate = (float)Math.Round(cameraRotXRate + 1f, 1);
+                cameraRotXText = cameraRotXRate.ToString("F1");
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            // Orbit (Y) row
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Orbit (Y) deg/s:", GUILayout.Width(105));
+            if (GUILayout.Button("-", GUILayout.Width(22)))
+            {
+                cameraRotYRate = (float)Math.Round(cameraRotYRate - 1f, 1);
+                cameraRotYText = cameraRotYRate.ToString("F1");
+                SaveToScenario();
+            }
+            string newYText = GUILayout.TextField(cameraRotYText, GUILayout.Width(50));
+            if (newYText != cameraRotYText)
+            {
+                cameraRotYText = newYText;
+                float yParsed;
+                if (float.TryParse(cameraRotYText, out yParsed))
+                {
+                    cameraRotYRate = yParsed;
+                    SaveToScenario();
+                }
+            }
+            if (GUILayout.Button("+", GUILayout.Width(22)))
+            {
+                cameraRotYRate = (float)Math.Round(cameraRotYRate + 1f, 1);
+                cameraRotYText = cameraRotYRate.ToString("F1");
+                SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.EndVertical();
+        }
+
+        GUILayout.Space(4);
         GUILayout.Label("Tip: Press '/' to toggle this window.");
 
         GUILayout.EndVertical();
@@ -991,7 +1031,7 @@ public class CameraSwitcherAuto : MonoBehaviour
 
         try
         {
-            var scen = CameraSwitcherScenario.Instance;
+            var scen = FastVesselChangerScenario.Instance;
             if (scen != null)
             {
                 foreach (var id in scen.selectedVesselIds)
@@ -1017,7 +1057,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             // Initialize lastSwitchTime so the first switch happens after switchInterval
             lastSwitchTime = Planetarium.GetUniversalTime();
             lastSwitchedVesselId = Guid.Empty; // Reset to force next switch
-            Debug.Log("[CameraSwitcherAuto] Auto-switch enabled. Interval: " + switchInterval + "s (minimum: " + MINIMUM_SWITCH_INTERVAL + "s)");
+            Debug.Log("[FastVesselChanger] Auto-switch enabled. Interval: " + switchInterval + "s (minimum: " + MINIMUM_SWITCH_INTERVAL + "s)");
         }
         else
         {
@@ -1028,7 +1068,7 @@ public class CameraSwitcherAuto : MonoBehaviour
                 switchIntervalText = switchInterval.ToString();
                 pendingInterval = -1;
             }
-            Debug.Log("[CameraSwitcherAuto] Auto-switch disabled.");
+            Debug.Log("[FastVesselChanger] Auto-switch disabled.");
         }
 
         SaveToScenario();
@@ -1062,7 +1102,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         // Prevent multiple switches in the same frame
         if (Time.frameCount == lastFrameCount)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] Preventing double-switch in same frame");
+            Debug.LogWarning("[FastVesselChanger] Preventing double-switch in same frame");
             return;
         }
         lastFrameCount = Time.frameCount;
@@ -1072,7 +1112,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             BuildCycleList();
             if (cycleList.Count == 0)
             {
-                Debug.Log("[CameraSwitcherAuto] No selected vessels to cycle.");
+                Debug.Log("[FastVesselChanger] No selected vessels to cycle.");
                 return;
             }
         }
@@ -1084,7 +1124,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         if (shuffleRemaining.Count == 0)
         {
             shuffleRemaining.AddRange(cycleList.Where(v => v != null));
-            Debug.Log("[CameraSwitcherAuto] Shuffle bag refilled for new round (" + shuffleRemaining.Count + " vessels)");
+            Debug.Log("[FastVesselChanger] Shuffle bag refilled for new round (" + shuffleRemaining.Count + " vessels)");
         }
 
         if (shuffleRemaining.Count == 0) return;
@@ -1116,7 +1156,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         else
             InvokeHideUI();
 
-        Debug.Log("[CameraSwitcherAuto] ToggleFlightHUD invoked " + (userPreferredUIVisible ? "ShowUI" : "HideUI"));
+        Debug.Log("[FastVesselChanger] ToggleFlightHUD invoked " + (userPreferredUIVisible ? "ShowUI" : "HideUI"));
     }
 
     void SwitchToVessel(Vessel v)
@@ -1148,8 +1188,8 @@ public class CameraSwitcherAuto : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] Warning: SetActiveVessel failed: " + e.Message);
-            ScreenMessages.PostScreenMessage("CameraSwitcherAuto: failed to activate vessel " + v.vesselName, 5f, ScreenMessageStyle.UPPER_CENTER);
+            Debug.LogError("[FastVesselChanger] Warning: SetActiveVessel failed: " + e.Message);
+            ScreenMessages.PostScreenMessage("FastVesselChanger: failed to activate vessel " + v.vesselName, 5f, ScreenMessageStyle.UPPER_CENTER);
             return;
         }
 
@@ -1176,7 +1216,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] Error focusing camera: " + e.Message);
+            Debug.LogError("[FastVesselChanger] Error focusing camera: " + e.Message);
         }
 
         // Restore window visibility after switch
@@ -1209,14 +1249,14 @@ public class CameraSwitcherAuto : MonoBehaviour
             _pendingRandomY = cameraRotYRate;
         }
 
-        Debug.Log("[CameraSwitcherAuto] Switched to vessel: " + v.vesselName);
+        Debug.Log("[FastVesselChanger] Switched to vessel: " + v.vesselName);
     }
 
     void SaveToScenario()
     {
         try
         {
-            var scen = CameraSwitcherScenario.Instance;
+            var scen = FastVesselChangerScenario.Instance;
             if (scen != null)
             {
                 scen.switchInterval = switchInterval;
@@ -1251,7 +1291,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("[CameraSwitcherAuto] SaveToScenario error: " + e.Message);
+            Debug.LogError("[FastVesselChanger] SaveToScenario error: " + e.Message);
         }
     }
 
@@ -1269,7 +1309,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             }
             if (alType == null)
             {
-                Debug.LogWarning("[CameraSwitcherAuto] ApplicationLauncher type not found");
+                Debug.LogWarning("[FastVesselChanger] ApplicationLauncher type not found");
                 return;
             }
 
@@ -1277,7 +1317,7 @@ public class CameraSwitcherAuto : MonoBehaviour
             var instance = instanceProp?.GetValue(null, null);
             if (instance == null)
             {
-                Debug.Log("[CameraSwitcherAuto] ApplicationLauncher.Instance not yet available");
+                Debug.Log("[FastVesselChanger] ApplicationLauncher.Instance not yet available");
                 return;
             }
 
@@ -1291,17 +1331,17 @@ public class CameraSwitcherAuto : MonoBehaviour
             Type callbackType = alType.Assembly.GetType("Callback");
             if (callbackType == null)
             {
-                Debug.LogWarning("[CameraSwitcherAuto] Callback delegate type not found");
+                Debug.LogWarning("[FastVesselChanger] Callback delegate type not found");
                 return;
             }
             
             Delegate onTrue = Delegate.CreateDelegate(callbackType, this, "OnAppTrue");
             Delegate onFalse = Delegate.CreateDelegate(callbackType, this, "OnAppFalse");
 
-            Texture2D icon = GameDatabase.Instance.GetTexture("CameraSwitcherAuto/Textures/icon", false);
+            Texture2D icon = GameDatabase.Instance.GetTexture("FastVesselChanger/Textures/icon", false);
             if (icon == null)
             {
-                Debug.LogWarning("[CameraSwitcherAuto] Icon texture not found — using 1x1 fallback");
+                Debug.LogWarning("[FastVesselChanger] Icon texture not found — using 1x1 fallback");
                 icon = new Texture2D(1, 1);
                 icon.SetPixel(0, 0, new Color(0.75f, 0.1f, 0.1f));
                 icon.Apply();
@@ -1311,17 +1351,17 @@ public class CameraSwitcherAuto : MonoBehaviour
                 .FirstOrDefault(m => m.Name == "AddModApplication" && m.GetParameters().Length == 8);
             if (addMethod == null)
             {
-                Debug.LogWarning("[CameraSwitcherAuto] AddModApplication(8) method not found");
+                Debug.LogWarning("[FastVesselChanger] AddModApplication(8) method not found");
                 return;
             }
 
             appButton = addMethod.Invoke(instance, new object[]
                 { onTrue, onFalse, null, null, null, null, scenes, icon });
-            Debug.Log("[CameraSwitcherAuto] AppLauncher button added successfully: " + (appButton != null));
+            Debug.Log("[FastVesselChanger] AppLauncher button added successfully: " + (appButton != null));
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] AppLauncher button failed: " + e.GetType().Name + ": " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] AppLauncher button failed: " + e.GetType().Name + ": " + e.Message);
         }
     }
 
@@ -1350,12 +1390,12 @@ public class CameraSwitcherAuto : MonoBehaviour
             {
                 showWindow = true;
                 SaveToScenario();
-                Debug.Log("[CameraSwitcherAuto] Window opened via toolbar");
+                Debug.Log("[FastVesselChanger] Window opened via toolbar");
             }
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] OnAppTrue callback failed: " + e.GetType().Name + ": " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] OnAppTrue callback failed: " + e.GetType().Name + ": " + e.Message);
             try { showWindow = true; } catch { }
         }
     }
@@ -1368,12 +1408,12 @@ public class CameraSwitcherAuto : MonoBehaviour
             {
                 showWindow = false;
                 SaveToScenario();
-                Debug.Log("[CameraSwitcherAuto] Window closed via toolbar");
+                Debug.Log("[FastVesselChanger] Window closed via toolbar");
             }
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] OnAppFalse callback failed: " + e.GetType().Name + ": " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] OnAppFalse callback failed: " + e.GetType().Name + ": " + e.Message);
             try { showWindow = false; } catch { }
         }
     }
@@ -1389,7 +1429,7 @@ public class CameraSwitcherAuto : MonoBehaviour
         try
         {
             InvokeShowUI();
-            Debug.Log("[CameraSwitcherAuto] Showing UI when leaving flight scene");
+            Debug.Log("[FastVesselChanger] Showing UI when leaving flight scene");
         }
         catch { }
         
@@ -1421,9 +1461,9 @@ public class CameraSwitcherAuto : MonoBehaviour
 }
 
 // Minimal addon that registers the stock AppLauncher button in Space Center and Tracking Station.
-// The main CameraSwitcherAuto addon (Flight) handles Flight and Map View.
+// The main FastVesselChanger addon (Flight) handles Flight and Map View.
 [KSPAddon(KSPAddon.Startup.SpaceCentre | KSPAddon.Startup.TrackingStation, false)]
-public class CameraSwitcherAutoNonFlight : MonoBehaviour
+public class FastVesselChangerNonFlight : MonoBehaviour
 {
     private object _appButton = null;
 
@@ -1490,7 +1530,7 @@ public class CameraSwitcherAutoNonFlight : MonoBehaviour
                 ? Delegate.CreateDelegate(onFalseType, this, "OnFalse")
                 : (Delegate)(UnityEngine.Events.UnityAction)OnFalse;
 
-            Texture2D icon = GameDatabase.Instance.GetTexture("CameraSwitcherAuto/Textures/icon", false);
+            Texture2D icon = GameDatabase.Instance.GetTexture("FastVesselChanger/Textures/icon", false);
             if (icon == null) icon = new Texture2D(1, 1);
 
             var addMethod = alType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
@@ -1500,7 +1540,7 @@ public class CameraSwitcherAutoNonFlight : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[CameraSwitcherAuto] NonFlight button failed: " + e.Message);
+            Debug.LogWarning("[FastVesselChanger] NonFlight button failed: " + e.Message);
         }
     }
 

@@ -1,0 +1,32 @@
+{
+    "spec_version"   : 1,
+    "identifier"     : "FastVesselChanger",
+    "name"           : "Fast Vessel Changer",
+    "abstract"       : "Automatically cycle through selected vessels with customizable intervals.",
+    "$kref"          : "#/ckan/github/AdmiralRadish/FastVesselChanger",
+    "license"        : "MIT",
+    "author"         : "NickAdmiralRadish",
+    "resources": {
+        "homepage"   : "https://github.com/AdmiralRadish/FastVesselChanger",
+        "repository" : "https://github.com/AdmiralRadish/FastVesselChanger",
+        "bugtracker" : "https://github.com/AdmiralRadish/FastVesselChanger/issues"
+    },
+    "tags": [
+        "plugin",
+        "control"
+    ],
+    "provides": [
+        "fast-vessel-changer"
+    ],
+    "suggests": [
+        { "name": "LunaMultiplayer" }
+    ],
+    "ksp_version_min": "1.8",
+    "ksp_version_max": "1.12.5",
+    "install": [
+        {
+            "find"       : "FastVesselChanger",
+            "install_to" : "GameData"
+        }
+    ]
+}

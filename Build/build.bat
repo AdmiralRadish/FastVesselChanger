@@ -1,5 +1,5 @@
-@echo off
-REM Build script for CameraSwitcherAuto using .NET CLI (VS 2026 compatible)
+﻿@echo off
+REM Build script for FastVesselChanger using .NET CLI (VS 2026 compatible)
 REM Usage: build.bat [Configuration] [Platform]
 REM Example: build.bat Release x64
 
@@ -16,10 +16,10 @@ if "%PLATFORM%"=="" (
   set PLATFORM=x64
 )
 
-echo Building CameraSwitcherAuto with %CONFIG% configuration and %PLATFORM% platform...
+echo Building FastVesselChanger with %CONFIG% configuration and %PLATFORM% platform...
 
 REM Build using dotnet CLI
-dotnet build ".\CameraSwitcherAuto.sln" -c %CONFIG% -f net472 || (
+dotnet build ".\FastVesselChanger.sln" -c %CONFIG% -f net472 || (
   echo Build failed!
   pause
   exit /b 1
@@ -27,7 +27,7 @@ dotnet build ".\CameraSwitcherAuto.sln" -c %CONFIG% -f net472 || (
 
 echo.
 echo Build complete. KSPBuildTools will automatically handle GameData packaging.
-echo The output DLL will be placed in: GameData\CameraSwitcherAuto\Plugins\
+echo The output DLL will be placed in: GameData\FastVesselChanger\Plugins\
 echo.
 pause
 

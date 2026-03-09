@@ -1,8 +1,8 @@
-Microsoft Visual Studio Solution File, Format Version 12.00
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 18
 VisualStudioVersion = 18.0.36930.0
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CameraSwitcherAuto", "CameraSwitcherAuto\CameraSwitcherAuto.csproj", "{13EA0A2C-4D4C-4F0A-94CF-6E45C57C36D6}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FastVesselChanger", "FastVesselChanger\FastVesselChanger.csproj", "{13EA0A2C-4D4C-4F0A-94CF-6E45C57C36D6}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
   <!-- VS 2026 / Modern .NET Project Format -->
   <PropertyGroup>
@@ -7,8 +7,8 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     
-    <RootNamespace>CameraSwitcherAuto</RootNamespace>
-    <AssemblyName>CameraSwitcherAuto</AssemblyName>
+    <RootNamespace>FastVesselChanger</RootNamespace>
+    <AssemblyName>FastVesselChanger</AssemblyName>
     <OutputType>Library</OutputType>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     
@@ -59,10 +59,10 @@
 
   <!-- Source Files -->
   <ItemGroup>
-    <Compile Include="..\Source\CameraSwitcherAuto.cs" />
+    <Compile Include="..\Source\FastVesselChanger.cs" />
     <Compile Include="..\Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="CameraSwitcherAuto.csproj.user" />
+    <None Include="FastVesselChanger.csproj.user" />
   </ItemGroup>
 </Project>
