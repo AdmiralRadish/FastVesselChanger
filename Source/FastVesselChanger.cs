@@ -333,6 +333,8 @@ public static class PersistenceHelpers
 [KSPAddon(KSPAddon.Startup.Flight, false)]
 public class FastVesselChanger : MonoBehaviour
 {
+    private static FastVesselChanger _activeInstance;
+
     // Minimum time (seconds) between any two switches to prevent rapid switching
     private const double MINIMUM_SWITCH_INTERVAL = 10.0;
 
@@ -391,10 +393,24 @@ public class FastVesselChanger : MonoBehaviour
 
     private List<Vessel> cycleList = new List<Vessel>();      // full selected vessel list
     private List<Vessel> shuffleRemaining = new List<Vessel>(); // vessels not yet visited this round
-    private object appButton = null;
+    private object _appButton = null;
+    private bool _isAddingAppButton = false;
+    private Coroutine _retryButtonCoroutine = null;
     
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
+
+    void Awake()
+    {
+        if (_activeInstance != null && _activeInstance != this)
+        {
+            Debug.LogWarning("[FastVesselSwitcher] Duplicate Flight addon instance detected; destroying duplicate.");
+            Destroy(this);
+            return;
+        }
+
+        _activeInstance = this;
+    }
 
     void Start()
     {
@@ -491,7 +507,7 @@ public class FastVesselChanger : MonoBehaviour
         // Stock AppLauncher button — subscribe to the event AND start a retry coroutine,
         // because the event may have already fired before we subscribed.
         GameEvents.onGUIApplicationLauncherReady.Add(OnGUIAppLauncherReady);
-        StartCoroutine(RetryAppLauncherButton());
+        _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
     }
 
     void CacheUIMasterController()
@@ -1284,9 +1300,14 @@ public class FastVesselChanger : MonoBehaviour
         }
     }
 
-    void AddAppLauncherButton()
+    void AddAppLauncherButton(string source)
     {
-        if (appButton != null) return;
+        if (_appButton != null || _isAddingAppButton)
+        {
+            return;
+        }
+
+        _isAddingAppButton = true;
         try
         {
             Type alType = null;
@@ -1298,7 +1319,7 @@ public class FastVesselChanger : MonoBehaviour
             }
             if (alType == null)
             {
-                Debug.LogWarning("[FastVesselChanger] ApplicationLauncher type not found");
+                Debug.LogWarning("[FastVesselSwitcher] AppLauncher add failed (" + source + "): type not found");
                 return;
             }
 
@@ -1306,7 +1327,7 @@ public class FastVesselChanger : MonoBehaviour
             var instance = instanceProp?.GetValue(null, null);
             if (instance == null)
             {
-                Debug.Log("[FastVesselChanger] ApplicationLauncher.Instance not yet available");
+                Debug.Log("[FastVesselSwitcher] AppLauncher add deferred (" + source + "): Instance not yet available");
                 return;
             }
 
@@ -1320,7 +1341,7 @@ public class FastVesselChanger : MonoBehaviour
             Type callbackType = alType.Assembly.GetType("Callback");
             if (callbackType == null)
             {
-                Debug.LogWarning("[FastVesselChanger] Callback delegate type not found");
+                Debug.LogWarning("[FastVesselSwitcher] AppLauncher add failed (" + source + "): Callback type not found");
                 return;
             }
             
@@ -1340,35 +1361,45 @@ public class FastVesselChanger : MonoBehaviour
                 .FirstOrDefault(m => m.Name == "AddModApplication" && m.GetParameters().Length == 8);
             if (addMethod == null)
             {
-                Debug.LogWarning("[FastVesselChanger] AddModApplication(8) method not found");
+                Debug.LogWarning("[FastVesselSwitcher] AppLauncher add failed (" + source + "): AddModApplication(8) not found");
                 return;
             }
 
-            appButton = addMethod.Invoke(instance, new object[]
+            _appButton = addMethod.Invoke(instance, new object[]
                 { onTrue, onFalse, null, null, null, null, scenes, icon });
-            Debug.Log("[FastVesselChanger] AppLauncher button added successfully: " + (appButton != null));
+            Debug.Log("[FastVesselSwitcher] AppLauncher add " + (_appButton != null ? "succeeded" : "returned null") + " (" + source + ")");
         }
         catch (Exception e)
         {
-            Debug.LogWarning("[FastVesselChanger] AppLauncher button failed: " + e.GetType().Name + ": " + e.Message);
+            Debug.LogWarning("[FastVesselSwitcher] AppLauncher add failed (" + source + "): " + e.GetType().Name + ": " + e.Message);
+        }
+        finally
+        {
+            _isAddingAppButton = false;
         }
     }
 
     void OnGUIAppLauncherReady()
     {
-        AddAppLauncherButton();
+        AddAppLauncherButton("onGUIApplicationLauncherReady");
     }
 
     IEnumerator RetryAppLauncherButton()
     {
         // Try immediately, then keep retrying every second for up to 30s.
         // This handles the case where onGUIApplicationLauncherReady already fired before Start().
-        for (int i = 0; i < 30 && appButton == null; i++)
+        for (int i = 0; i < 30 && _appButton == null; i++)
         {
-            AddAppLauncherButton();
-            if (appButton != null) yield break;
+            AddAppLauncherButton("retry-" + i);
+            if (_appButton != null)
+            {
+                _retryButtonCoroutine = null;
+                yield break;
+            }
             yield return new WaitForSeconds(1f);
         }
+
+        _retryButtonCoroutine = null;
     }
 
     void OnAppTrue()
@@ -1409,8 +1440,18 @@ public class FastVesselChanger : MonoBehaviour
 
     void OnDestroy()
     {
+        if (_activeInstance == this)
+            _activeInstance = null;
+
         GameEvents.onShowUI.Remove(OnShowUI);
         GameEvents.onVesselLoaded.Remove(OnVesselLoaded);
+        GameEvents.onGUIApplicationLauncherReady.Remove(OnGUIAppLauncherReady);
+
+        if (_retryButtonCoroutine != null)
+        {
+            StopCoroutine(_retryButtonCoroutine);
+            _retryButtonCoroutine = null;
+        }
 
         SaveToScenario(); // Save state before destroying
 
@@ -1422,14 +1463,16 @@ public class FastVesselChanger : MonoBehaviour
         }
         catch { }
         
-        if (appButton != null)
+        if (_appButton != null)
         {
+            bool removed = false;
             try
             {
                 Type alType = null;
                 foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
                 {
-                    alType = a.GetType("ApplicationLauncher");
+                    alType = a.GetType("ApplicationLauncher")
+                           ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
                     if (alType != null) break;
                 }
                 if (alType != null)
@@ -1438,14 +1481,21 @@ public class FastVesselChanger : MonoBehaviour
                     var instance = instanceProp?.GetValue(null, null);
                     var rem = alType.GetMethod("RemoveModApplication", BindingFlags.Public | BindingFlags.Instance);
                     if (rem != null && instance != null)
-                        rem.Invoke(instance, new object[] { appButton });
+                    {
+                        Debug.Log("[FastVesselSwitcher] AppLauncher remove attempt starting.");
+                        rem.Invoke(instance, new object[] { _appButton });
+                        removed = true;
+                    }
                 }
             }
-            catch { }
-            appButton = null;
-        }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[FastVesselSwitcher] AppLauncher remove failed: " + e.GetType().Name + ": " + e.Message);
+            }
 
-        GameEvents.onGUIApplicationLauncherReady.Remove(OnGUIAppLauncherReady);
+            Debug.Log("[FastVesselSwitcher] AppLauncher remove " + (removed ? "succeeded." : "could not run (instance/method missing)."));
+            _appButton = null;
+        }
     }
 }
 

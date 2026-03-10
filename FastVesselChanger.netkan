@@ -1,32 +1,7 @@
-{
-    "spec_version"   : 1,
-    "identifier"     : "FastVesselChanger",
-    "name"           : "Fast Vessel Changer",
-    "abstract"       : "Quickly Cycle through selected vessels with timer-based switching, type filters, and quick in-flight controls.",
-    "$kref"          : "#/ckan/github/AdmiralRadish/FastVesselChanger",
-    "license"        : "MIT",
-    "author"         : "NickAdmiralRadish",
-    "resources": {
-        "homepage"   : "https://github.com/AdmiralRadish/FastVesselChanger",
-        "repository" : "https://github.com/AdmiralRadish/FastVesselChanger",
-        "bugtracker" : "https://github.com/AdmiralRadish/FastVesselChanger/issues"
-    },
-    "tags": [
-        "plugin",
-        "control"
-    ],
-    "provides": [
-        "fast-vessel-changer"
-    ],
-    "suggests": [
-        { "name": "LunaMultiplayer" }
-    ],
-    "ksp_version_min": "1.8",
-    "ksp_version_max": "1.12.5",
-    "install": [
-        {
-            "find"       : "FastVesselChanger",
-            "install_to" : "GameData"
-        }
-    ]
-}
+identifier: FastVesselChanger
+$kref: '#/ckan/github/AdmiralRadish/FastVesselChanger'
+ksp_version_min: '1.8'
+ksp_version_max: '1.12'
+tags:
+  - plugin
+  - control
