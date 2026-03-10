@@ -67,7 +67,6 @@ public static class FVCLunaHelper
                 // Try to get from LunaMultiplayer.Client.Main.MyPlayer.PlayerName
                 var assemblies = AppDomain.CurrentDomain.GetAssemblies();
                 Type mainType = null;
-                Type myPlayerType = null;
 
                 foreach (var a in assemblies)
                 {
@@ -92,7 +91,7 @@ public static class FVCLunaHelper
                                 var playerName = playerNameProp.GetValue(myPlayer) as string;
                                 if (!string.IsNullOrEmpty(playerName))
                                 {
-                                    _cachedPlayerName = SanitizePlayerName(playerName);
+                                    _cachedPlayerName = SanitizePlayerName(playerName!);
                                     Debug.Log("[FastVesselChanger] Detected Luna player: " + _cachedPlayerName);
                                     return _cachedPlayerName;
                                 }
