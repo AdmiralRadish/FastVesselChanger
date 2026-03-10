@@ -10,8 +10,10 @@ using UnityEngine;
 /// <summary>
 /// Helper class to detect and interact with LunaMultiplayer server
 /// Uses reflection to avoid hard dependency on Luna DLLs
+/// Prefixed FVC to avoid type-name collision with identically-named helpers
+/// in other KSP mods loaded into the same AppDomain.
 /// </summary>
-public static class LunaMultiplayerHelper
+public static class FVCLunaHelper
 {
     private static bool? _isLunaAvailable = null;
     private static string _cachedPlayerName = null;
@@ -166,7 +168,7 @@ public class FastVesselChangerScenario : ScenarioModule
     /// </summary>
     private string GetPlayerKey()
     {
-        return LunaMultiplayerHelper.GetCurrentPlayerName();
+        return FVCLunaHelper.GetCurrentPlayerName();
     }
 
     /// <summary>
@@ -298,7 +300,8 @@ public class FastVesselChangerScenario : ScenarioModule
     }
 }
 
-public static class PersistenceHelpers
+// Prefixed FVC to avoid type-name collision with identically-named helpers in other mods.
+public static class FVCPersistenceHelpers
 {
     // Serialize a list of Guids to a list of strings
     public static List<string> SerializeGuidList(List<Guid> guids)
@@ -414,16 +417,27 @@ public class FastVesselChanger : MonoBehaviour
 
     void Start()
     {
+        // Awake() may have called Destroy(this) if a duplicate was detected, but Unity still
+        // invokes Start() on the same frame (destruction is deferred to end-of-frame).
+        // Without this guard both this instance and the surviving active instance would each
+        // register their own event subscription and retry coroutine — two independent _appButton
+        // instance fields both null — leading to two AddModApplication calls and two toolbar icons.
+        if (_activeInstance != this)
+        {
+            Debug.LogWarning("[FastVesselSwitcher] Start() called on non-active duplicate instance; aborting.");
+            return;
+        }
+
         Debug.Log("[FastVesselChanger] started");
         
         // Initialize lastSwitchTime to prevent premature switching on startup
         lastSwitchTime = Planetarium.GetUniversalTime();
         
         // Log multiplayer status
-        if (LunaMultiplayerHelper.IsLunaEnabled)
+        if (FVCLunaHelper.IsLunaEnabled)
         {
             Debug.Log("[FastVesselChanger] LunaMultiplayer detected - using per-player settings");
-            string playerName = LunaMultiplayerHelper.GetCurrentPlayerName();
+            string playerName = FVCLunaHelper.GetCurrentPlayerName();
             Debug.Log("[FastVesselChanger] Current player: " + playerName);
         }
         else

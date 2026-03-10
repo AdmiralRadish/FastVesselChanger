@@ -15,6 +15,7 @@ GameData/CameraSwitcherAuto
 # Rider
 .idea/
 .vs/
+*.zip
 
 *.dll
 LUNAMULTIPLAYER.md
