@@ -5,14 +5,8 @@
 *.userprefs
 *.userosscache
 *.user
-*s.md
-
-# Build outputs
 bin/
 obj/
-GameData/CameraSwitcherAuto
-
-# Rider
 .idea/
 .vs/
 *.zip
@@ -22,3 +16,16 @@ LUNAMULTIPLAYER.md
 *_*.md
 *.htm
 NuGet.config
+
+# Build outputs
+
+
+# GameData Plugins (built output — not source-controlled)
+GameData/*/Plugins/*.dll
+GameData/*/Plugins/*.pdb
+
+# Rider
+.idea/
+*.htm
+
+StagingBlocker.netkan

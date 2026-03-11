@@ -396,6 +396,7 @@ public class FastVesselChanger : MonoBehaviour
     private List<Vessel> cycleList = new List<Vessel>();      // full selected vessel list
     private List<Vessel> shuffleRemaining = new List<Vessel>(); // vessels not yet visited this round
     private object _appButton = null;
+    private static object _sharedAppButton = null;
     private bool _isAddingAppButton = false;
     private Coroutine _retryButtonCoroutine = null;
     
@@ -520,6 +521,7 @@ public class FastVesselChanger : MonoBehaviour
         // Stock AppLauncher button — subscribe to the event AND start a retry coroutine,
         // because the event may have already fired before we subscribed.
         GameEvents.onGUIApplicationLauncherReady.Add(OnGUIAppLauncherReady);
+        GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnGUIAppLauncherUnreadifying);
         _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
     }
 
@@ -1315,6 +1317,18 @@ public class FastVesselChanger : MonoBehaviour
 
     void AddAppLauncherButton(string source)
     {
+        if (_activeInstance != this)
+        {
+            return;
+        }
+
+        // If a previous instance left a valid button behind, adopt it instead of creating a second icon.
+        if (_sharedAppButton != null)
+        {
+            _appButton = _sharedAppButton;
+            return;
+        }
+
         if (_appButton != null || _isAddingAppButton)
         {
             return;
@@ -1380,6 +1394,8 @@ public class FastVesselChanger : MonoBehaviour
 
             _appButton = addMethod.Invoke(instance, new object[]
                 { onTrue, onFalse, null, null, null, null, scenes, icon });
+            if (_appButton != null)
+                _sharedAppButton = _appButton;
             Debug.Log("[FastVesselSwitcher] AppLauncher add " + (_appButton != null ? "succeeded" : "returned null") + " (" + source + ")");
         }
         catch (Exception e)
@@ -1395,6 +1411,12 @@ public class FastVesselChanger : MonoBehaviour
     void OnGUIAppLauncherReady()
     {
         AddAppLauncherButton("onGUIApplicationLauncherReady");
+    }
+
+    void OnGUIAppLauncherUnreadifying(GameScenes _)
+    {
+        // Mirror SCANsat's lifecycle pattern: remove our button before AppLauncher rebuild.
+        RemoveAppLauncherButton("onGUIApplicationLauncherUnreadifying", forceClearShared: true);
     }
 
     IEnumerator RetryAppLauncherButton()
@@ -1459,6 +1481,7 @@ public class FastVesselChanger : MonoBehaviour
         GameEvents.onShowUI.Remove(OnShowUI);
         GameEvents.onVesselLoaded.Remove(OnVesselLoaded);
         GameEvents.onGUIApplicationLauncherReady.Remove(OnGUIAppLauncherReady);
+        GameEvents.onGUIApplicationLauncherUnreadifying.Remove(OnGUIAppLauncherUnreadifying);
 
         if (_retryButtonCoroutine != null)
         {
@@ -1476,39 +1499,48 @@ public class FastVesselChanger : MonoBehaviour
         }
         catch { }
         
-        if (_appButton != null)
-        {
-            bool removed = false;
-            try
-            {
-                Type alType = null;
-                foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
-                {
-                    alType = a.GetType("ApplicationLauncher")
-                           ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
-                    if (alType != null) break;
-                }
-                if (alType != null)
-                {
-                    var instanceProp = alType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                    var instance = instanceProp?.GetValue(null, null);
-                    var rem = alType.GetMethod("RemoveModApplication", BindingFlags.Public | BindingFlags.Instance);
-                    if (rem != null && instance != null)
-                    {
-                        Debug.Log("[FastVesselSwitcher] AppLauncher remove attempt starting.");
-                        rem.Invoke(instance, new object[] { _appButton });
-                        removed = true;
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[FastVesselSwitcher] AppLauncher remove failed: " + e.GetType().Name + ": " + e.Message);
-            }
+        RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
+    }
 
-            Debug.Log("[FastVesselSwitcher] AppLauncher remove " + (removed ? "succeeded." : "could not run (instance/method missing)."));
-            _appButton = null;
+    void RemoveAppLauncherButton(string source, bool forceClearShared)
+    {
+        // If this instance is tied to a shared button reference, clean it up once.
+        var buttonToRemove = _appButton ?? _sharedAppButton;
+        if (buttonToRemove == null)
+            return;
+
+        bool removed = false;
+        try
+        {
+            Type alType = null;
+            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                alType = a.GetType("ApplicationLauncher")
+                       ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
+                if (alType != null) break;
+            }
+            if (alType != null)
+            {
+                var instanceProp = alType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                var instance = instanceProp?.GetValue(null, null);
+                var rem = alType.GetMethod("RemoveModApplication", BindingFlags.Public | BindingFlags.Instance);
+                if (rem != null && instance != null)
+                {
+                    Debug.Log("[FastVesselSwitcher] AppLauncher remove attempt starting (" + source + ").");
+                    rem.Invoke(instance, new object[] { buttonToRemove });
+                    removed = true;
+                }
+            }
         }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselSwitcher] AppLauncher remove failed (" + source + "): " + e.GetType().Name + ": " + e.Message);
+        }
+
+        Debug.Log("[FastVesselSwitcher] AppLauncher remove " + (removed ? "succeeded." : "could not run (instance/method missing).") + " (" + source + ")");
+        _appButton = null;
+        if (forceClearShared || removed)
+            _sharedAppButton = null;
     }
 }
 
@@ -1522,10 +1554,13 @@ public class FastVesselChangerNonFlight : MonoBehaviour
     void Start()
     {
         GameEvents.onGUIApplicationLauncherReady.Add(OnAppLauncherReady);
+        GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnAppLauncherUnreadifying);
         StartCoroutine(RetryButton());
     }
 
     void OnAppLauncherReady() { AddButton(); }
+
+    void OnAppLauncherUnreadifying(GameScenes _) { RemoveButton("onGUIApplicationLauncherUnreadifying"); }
 
     System.Collections.IEnumerator RetryButton()
     {
@@ -1602,13 +1637,19 @@ public class FastVesselChangerNonFlight : MonoBehaviour
     void OnDestroy()
     {
         GameEvents.onGUIApplicationLauncherReady.Remove(OnAppLauncherReady);
+        GameEvents.onGUIApplicationLauncherUnreadifying.Remove(OnAppLauncherUnreadifying);
+        RemoveButton("OnDestroy");
+    }
+
+    void RemoveButton(string source)
+    {
         if (_appButton == null) return;
         try
         {
             Type alType = null;
             foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
             {
-                alType = a.GetType("ApplicationLauncher");
+                alType = a.GetType("ApplicationLauncher") ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
                 if (alType != null) break;
             }
             if (alType != null)
@@ -1620,7 +1661,10 @@ public class FastVesselChangerNonFlight : MonoBehaviour
                     rem.Invoke(instance, new object[] { _appButton });
             }
         }
-        catch { }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] NonFlight button remove failed (" + source + "): " + e.Message);
+        }
         _appButton = null;
     }
 }
