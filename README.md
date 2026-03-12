@@ -43,6 +43,7 @@ Copy the entire `GameData/FastVesselChanger` folder with the built DLL into your
 - **Vessel Selection**: Check/uncheck vessels in the UI to include them in the cycle
 - **Type Filter**: Filter vessels by type (Ship, Station, Probe, Lander, Rover, Plane, Debris, etc.)
 - **Window State**: The UI remembers whether it was open or closed when you close/open your save
+- **Local UI Preferences**: Window position, filter panel state, and active vessel type filters are stored in the XML prefs file
 
 ## Multi-Player Support (LunaMultiplayer)
 This mod is **fully compatible with LunaMultiplayer servers**. Each player has completely separate settings:

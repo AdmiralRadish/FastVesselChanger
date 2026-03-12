@@ -1,8 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.Collections;
+using System.Globalization;
+using System.IO;
 using System.Reflection;
 using System.Linq;
+using System.Xml;
 using UnityEngine;
 
 #pragma warning disable CS8618, CS8600, CS8601, CS8625
@@ -155,7 +158,7 @@ public class FastVesselChangerScenario : ScenarioModule
     public bool cameraRotRandomEnabled = false;
     public float cameraRotXRate = 0f;   // pitch deg/s (positive = up)
     public float cameraRotYRate = 10f;  // orbit deg/s (positive = right)
-    public bool zoomTrackingEnabled = false;
+    public bool zoomTrackingEnabled = true;
     public List<string> selectedVesselIds = new List<string>();
     public List<string> selectedVesselTypes = new List<string>();
 
@@ -336,6 +339,7 @@ public static class FVCPersistenceHelpers
 public class FastVesselChanger : MonoBehaviour
 {
     private static FastVesselChanger _activeInstance;
+    private const string USER_PREFS_FILE_NAME = "FastVesselChanger.xml";
 
     // Minimum time (seconds) between any two switches to prevent rapid switching
     private const double MINIMUM_SWITCH_INTERVAL = 10.0;
@@ -345,11 +349,13 @@ public class FastVesselChanger : MonoBehaviour
 
     private const float BASE_SCROLL_HEIGHT = 350f;
     private const float FIXED_WINDOW_WIDTH = 400f;
+    private const float MIN_WINDOW_HEIGHT = 240f;
     private bool showWindow = true;
     private bool showTypeFilter = false; // Toggle for vessel type filter section
     private bool lastShowTypeFilter = false; // Track previous state to detect changes
-    private bool showCameraControls = true; // Toggle for camera controls section
-    private bool lastShowCameraControls = true; // Track previous state to detect changes
+    private bool _loadedTypeFiltersFromUserPrefs = false;
+    private bool showCameraControls = false; // Toggle for camera controls section
+    private bool lastShowCameraControls = false; // Track previous state to detect changes
     private string vesselSearchText = ""; // Live search filter for vessel list
 
     private Dictionary<Guid, bool> selected = new Dictionary<Guid, bool>();
@@ -447,6 +453,7 @@ public class FastVesselChanger : MonoBehaviour
 
         InitializeVesselTypeFilter();
         RefreshSelectionsFromVessels();
+        LoadUserPrefs();
         
         // Load persisted settings if scenario exists
         try
@@ -466,6 +473,7 @@ public class FastVesselChanger : MonoBehaviour
                 cameraRotXText = cameraRotXRate.ToString("F1");
                 cameraRotYText = cameraRotYRate.ToString("F1");
                 zoomTrackingEnabled = scen.zoomTrackingEnabled;
+                // Window position and local filter prefs are loaded from the XML user prefs in LoadUserPrefs().
                 selected.Clear();
                 foreach (var id in scen.selectedVesselIds)
                 {
@@ -476,14 +484,12 @@ public class FastVesselChanger : MonoBehaviour
                     }
                     catch { }
                 }
-                // Load vessel type filters — reset all to false first so unchecked types don't linger
-                if (scen.selectedVesselTypes.Count > 0)
+
+                if (!_loadedTypeFiltersFromUserPrefs && scen.selectedVesselTypes.Count > 0)
                 {
-                    foreach (var key in vesselTypeFilter.Keys.ToList())
-                        vesselTypeFilter[key] = false;
-                    foreach (var typeStr in scen.selectedVesselTypes)
-                        if (vesselTypeFilter.ContainsKey(typeStr))
-                            vesselTypeFilter[typeStr] = true;
+                    ApplyEnabledTypeFilters(scen.selectedVesselTypes);
+                    _loadedTypeFiltersFromUserPrefs = true;
+                    SaveUserPrefs();
                 }
             }
         }
@@ -752,17 +758,44 @@ public class FastVesselChanger : MonoBehaviour
             lastShowCameraControls = showCameraControls;
         }
         
+        var prevRect = windowRect;
         windowRect = GUILayout.Window(GetInstanceID(), windowRect, DrawWindow, "Fast Vessel Changer",
             GUILayout.Width(FIXED_WINDOW_WIDTH));
+        if (windowRect.x != prevRect.x || windowRect.y != prevRect.y)
+            SaveUserPrefs();
     }
 
     void DrawWindow(int id)
     {
         GUILayout.BeginVertical();
 
-        // ---- Vessel Type Filter ----
-        if (GUILayout.Button((showTypeFilter ? "[-] " : "[+] ") + "Vessel Type Filter"))
+        // ---- Vessel List ----
+        int selectedCount = selected.Values.Count(v => v);
+        GUILayout.Label("Vessels (" + selectedCount + " selected):");
+
+        // Search bar
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Search:", GUILayout.Width(50));
+        vesselSearchText = GUILayout.TextField(vesselSearchText, GUILayout.ExpandWidth(true));
+        if (!string.IsNullOrEmpty(vesselSearchText) && GUILayout.Button("X", GUILayout.Width(24)))
+            vesselSearchText = "";
+        GUILayout.EndHorizontal();
+
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("Deselect All", GUILayout.Width(100)))
+        {
+            foreach (var key in selected.Keys.ToList())
+                selected[key] = false;
+            SaveToScenario();
+            BuildCycleList();
+        }
+        if (GUILayout.Button((showTypeFilter ? "[-] " : "[+] ") + "Filter", GUILayout.ExpandWidth(true)))
+        {
             showTypeFilter = !showTypeFilter;
+            SaveUserPrefs();
+        }
+        GUILayout.EndHorizontal();
+
         if (showTypeFilter)
         {
             GUILayout.BeginVertical("box");
@@ -779,6 +812,7 @@ public class FastVesselChanger : MonoBehaviour
                     if (toggled != prev)
                     {
                         vesselTypeFilter[typeKey] = toggled;
+                        SaveUserPrefs();
                         SaveToScenario();
                         RefreshSelectionsFromVessels();
                     }
@@ -787,20 +821,6 @@ public class FastVesselChanger : MonoBehaviour
             }
             GUILayout.EndVertical();
         }
-
-        GUILayout.Space(4);
-
-        // ---- Vessel List ----
-        int selectedCount = selected.Values.Count(v => v);
-        GUILayout.Label("Vessels (" + selectedCount + " selected):");
-
-        // Search bar
-        GUILayout.BeginHorizontal();
-        GUILayout.Label("Search:", GUILayout.Width(50));
-        vesselSearchText = GUILayout.TextField(vesselSearchText, GUILayout.ExpandWidth(true));
-        if (!string.IsNullOrEmpty(vesselSearchText) && GUILayout.Button("X", GUILayout.Width(24)))
-            vesselSearchText = "";
-        GUILayout.EndHorizontal();
 
         scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.Height(BASE_SCROLL_HEIGHT));
 
@@ -859,7 +879,10 @@ public class FastVesselChanger : MonoBehaviour
 
         // ---- Camera Controls ----
         if (GUILayout.Button((showCameraControls ? "[-] " : "[+] ") + "Camera Controls"))
+        {
             showCameraControls = !showCameraControls;
+            SaveUserPrefs();
+        }
         if (showCameraControls)
         {
             GUILayout.BeginVertical("box");
@@ -1033,6 +1056,18 @@ public class FastVesselChanger : MonoBehaviour
         return true; // Default to enabled if type not found
     }
 
+    void ApplyEnabledTypeFilters(IEnumerable<string> enabledTypes)
+    {
+        foreach (var key in vesselTypeFilter.Keys.ToList())
+            vesselTypeFilter[key] = false;
+
+        foreach (var type in enabledTypes)
+        {
+            if (vesselTypeFilter.ContainsKey(type))
+                vesselTypeFilter[type] = true;
+        }
+    }
+
     void RefreshSelectionsFromVessels()
     {
         var existing = new HashSet<Guid>();
@@ -1183,6 +1218,9 @@ public class FastVesselChanger : MonoBehaviour
     {
         if (v == null) return;
 
+        SaveToScenario();
+        SaveUserPrefs();
+
         bool windowWasVisible = showWindow;
 
         // Save zoom level for the current vessel before switching away
@@ -1270,6 +1308,156 @@ public class FastVesselChanger : MonoBehaviour
         }
 
         Debug.Log("[FastVesselChanger] Switched to vessel: " + v.vesselName);
+    }
+
+    void LoadUserPrefs()
+    {
+        try
+        {
+            _loadedTypeFiltersFromUserPrefs = false;
+            string prefsPath = GetUserPrefsPath();
+            if (!File.Exists(prefsPath))
+            {
+                if (TryLoadLegacyUserPrefs())
+                {
+                    SaveUserPrefs();
+                }
+                return;
+            }
+
+            var doc = new XmlDocument();
+            doc.Load(prefsPath);
+            XmlElement root = doc.DocumentElement;
+            if (root == null)
+                return;
+
+            showCameraControls = ParseBool(root["ShowCameraControls"]?.InnerText, false);
+            lastShowCameraControls = showCameraControls;
+            showTypeFilter = ParseBool(root["ShowTypeFilter"]?.InnerText, false);
+            lastShowTypeFilter = showTypeFilter;
+
+            XmlElement filters = root["TypeFilters"];
+            if (filters != null)
+            {
+                var enabledTypes = filters.GetElementsByTagName("Filter")
+                    .OfType<XmlElement>()
+                    .Select(filter => filter.GetAttribute("name"))
+                    .Where(name => !string.IsNullOrEmpty(name));
+                ApplyEnabledTypeFilters(enabledTypes);
+                _loadedTypeFiltersFromUserPrefs = true;
+            }
+
+            XmlElement window = root["Window"];
+            if (window == null)
+                return;
+
+            float wx = ParseFloat(window.GetAttribute("x"), windowRect.x);
+            float wy = ParseFloat(window.GetAttribute("y"), windowRect.y);
+            float ww = ParseFloat(window.GetAttribute("width"), windowRect.width);
+            float wh = ParseFloat(window.GetAttribute("height"), windowRect.height);
+            windowRect = new Rect(wx, wy, Mathf.Max(FIXED_WINDOW_WIDTH, ww), Mathf.Max(MIN_WINDOW_HEIGHT, wh));
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] LoadUserPrefs error: " + e.Message);
+        }
+    }
+
+    void SaveUserPrefs()
+    {
+        try
+        {
+            string prefsPath = GetUserPrefsPath();
+            string prefsDir = Path.GetDirectoryName(prefsPath);
+            if (!string.IsNullOrEmpty(prefsDir))
+                Directory.CreateDirectory(prefsDir);
+
+            var doc = new XmlDocument();
+            XmlElement root = doc.CreateElement("FastVesselChangerUserPrefs");
+            doc.AppendChild(root);
+
+            XmlElement showCameraControlsNode = doc.CreateElement("ShowCameraControls");
+            showCameraControlsNode.InnerText = showCameraControls.ToString();
+            root.AppendChild(showCameraControlsNode);
+
+            XmlElement showTypeFilterNode = doc.CreateElement("ShowTypeFilter");
+            showTypeFilterNode.InnerText = showTypeFilter.ToString();
+            root.AppendChild(showTypeFilterNode);
+
+            XmlElement filtersNode = doc.CreateElement("TypeFilters");
+            foreach (var kv in vesselTypeFilter.Where(kv => kv.Value))
+            {
+                XmlElement filterNode = doc.CreateElement("Filter");
+                filterNode.SetAttribute("name", kv.Key);
+                filtersNode.AppendChild(filterNode);
+            }
+            root.AppendChild(filtersNode);
+
+            XmlElement windowNode = doc.CreateElement("Window");
+            windowNode.SetAttribute("x", windowRect.x.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("y", windowRect.y.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("width", windowRect.width.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("height", windowRect.height.ToString(CultureInfo.InvariantCulture));
+            root.AppendChild(windowNode);
+
+            doc.Save(prefsPath);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] SaveUserPrefs error: " + e.Message);
+        }
+    }
+
+    string GetUserPrefsPath()
+    {
+        string assemblyDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+        if (string.IsNullOrEmpty(assemblyDir))
+            return USER_PREFS_FILE_NAME;
+
+        var pluginDir = new DirectoryInfo(assemblyDir);
+        DirectoryInfo modDir = pluginDir.Parent;
+        if (modDir == null)
+            return Path.Combine(assemblyDir, USER_PREFS_FILE_NAME);
+
+        return Path.Combine(modDir.FullName, "PluginData", USER_PREFS_FILE_NAME);
+    }
+
+    bool TryLoadLegacyUserPrefs()
+    {
+        try
+        {
+            var cfg = KSP.IO.PluginConfiguration.CreateForType<FastVesselChanger>();
+            cfg.load();
+            showCameraControls = cfg.GetValue<bool>("showCameraControls", false);
+            lastShowCameraControls = showCameraControls;
+            float wx = cfg.GetValue<float>("windowX", windowRect.x);
+            float wy = cfg.GetValue<float>("windowY", windowRect.y);
+            float ww = cfg.GetValue<float>("windowW", windowRect.width);
+            float wh = cfg.GetValue<float>("windowH", windowRect.height);
+            windowRect = new Rect(wx, wy, Mathf.Max(FIXED_WINDOW_WIDTH, ww), Mathf.Max(MIN_WINDOW_HEIGHT, wh));
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] Legacy user prefs migration failed: " + e.Message);
+            return false;
+        }
+    }
+
+    static float ParseFloat(string? value, float fallback)
+    {
+        float parsed;
+        if (float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed))
+            return parsed;
+        return fallback;
+    }
+
+    static bool ParseBool(string? value, bool fallback)
+    {
+        bool parsed;
+        if (bool.TryParse(value, out parsed))
+            return parsed;
+        return fallback;
     }
 
     void SaveToScenario()
@@ -1475,7 +1663,9 @@ public class FastVesselChanger : MonoBehaviour
 
     void OnDestroy()
     {
-        if (_activeInstance == this)
+        bool isActiveInstance = _activeInstance == this;
+
+        if (isActiveInstance)
             _activeInstance = null;
 
         GameEvents.onShowUI.Remove(OnShowUI);
@@ -1489,7 +1679,15 @@ public class FastVesselChanger : MonoBehaviour
             _retryButtonCoroutine = null;
         }
 
+        if (!isActiveInstance)
+        {
+            Debug.Log("[FastVesselChanger] Skipping persistence for duplicate destroyed flight addon instance.");
+            RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
+            return;
+        }
+
         SaveToScenario(); // Save state before destroying
+        SaveUserPrefs();
 
         // Ensure UI is visible when leaving flight scene so player isn't stuck with hidden UI
         try
