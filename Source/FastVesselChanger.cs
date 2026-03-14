@@ -380,7 +380,8 @@ public class FastVesselChanger : MonoBehaviour
     private string cameraRotYText = "10";
     private const float EXPANDED_MIN_PITCH = -100000f;
     private const float EXPANDED_MAX_PITCH = 100000f;
-    private const float CAMERA_MANUAL_PITCH_RATE_DEG = 90f;
+    private const float CAMERA_LOWER_POLE = -1.5707964f;
+    private const float CAMERA_POLE_WRAP_THRESHOLD = 0.0005f;
 
     // Widened pitch limits — cached originals restored when leaving flight
     private bool _pitchLimitsWidened = false;
@@ -414,11 +415,6 @@ public class FastVesselChanger : MonoBehaviour
     private bool _isAddingAppButton = false;
     private Coroutine _retryButtonCoroutine = null;
     private Coroutine _cameraPitchOverrideCoroutine = null;
-    private bool _pitchDebugEnabled = true;
-    private float _nextPitchDebugLogTime = 0f;
-    private const float PITCH_DEBUG_LOG_INTERVAL = 0.25f;
-    private bool _continuousPitchQuatActive = false;
-    private Quaternion _continuousPitchQuat = Quaternion.identity;
     
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
@@ -676,27 +672,6 @@ public class FastVesselChanger : MonoBehaviour
             }
         }
 
-        if (_pitchDebugEnabled && (Input.GetKey(KeyCode.UpArrow) || Input.GetKey(KeyCode.DownArrow))
-            && Time.realtimeSinceStartup >= _nextPitchDebugLogTime)
-        {
-            _nextPitchDebugLogTime = Time.realtimeSinceStartup + PITCH_DEBUG_LOG_INTERVAL;
-            if (camForLimits != null)
-            {
-                Debug.Log("[FastVesselChanger][PitchDebug] up=" + Input.GetKey(KeyCode.UpArrow)
-                    + " down=" + Input.GetKey(KeyCode.DownArrow)
-                    + " pitch=" + camForLimits.camPitch
-                    + " min=" + camForLimits.minPitch
-                    + " max=" + camForLimits.maxPitch
-                    + " widened=" + _pitchLimitsWidened);
-            }
-            else
-            {
-                Debug.Log("[FastVesselChanger][PitchDebug] cam=null up=" + Input.GetKey(KeyCode.UpArrow)
-                    + " down=" + Input.GetKey(KeyCode.DownArrow)
-                    + " widened=" + _pitchLimitsWidened);
-            }
-        }
-
         // Track F2 via Unity's input system. KSP's UIMasterController also handles F2 on its own,
         // but we sync our preference here so the control panel indicator stays accurate.
         // We don't call InvokeHideUI/ShowUI here because KSP's UIMasterController will do the
@@ -812,31 +787,17 @@ public class FastVesselChanger : MonoBehaviour
                 cam.maxPitch = EXPANDED_MAX_PITCH;
             }
 
-            float inputPitchRateDeg = 0f;
+            // KSP hard-clamps the negative pole at -PI/2 regardless of widened minPitch.
+            // Unwrap by +2PI at the lower pole so Down input can continue smoothly with
+            // no heading flip or mirror remap.
+            bool wantsPitchDown = Input.GetKey(KeyCode.DownArrow) || (cameraRotEnabled && cameraRotXRate < 0f);
+            if (wantsPitchDown && cam.camPitch <= CAMERA_LOWER_POLE + CAMERA_POLE_WRAP_THRESHOLD)
+            {
+                cam.camPitch += 2f * Mathf.PI;
+            }
+
             if (cameraRotEnabled && cameraRotXRate != 0f)
-                inputPitchRateDeg += cameraRotXRate;
-            if (Input.GetKey(KeyCode.UpArrow))
-                inputPitchRateDeg += CAMERA_MANUAL_PITCH_RATE_DEG;
-            if (Input.GetKey(KeyCode.DownArrow))
-                inputPitchRateDeg -= CAMERA_MANUAL_PITCH_RATE_DEG;
-
-            if (Mathf.Abs(inputPitchRateDeg) > 0.0001f)
-            {
-                if (!_continuousPitchQuatActive)
-                {
-                    _continuousPitchQuat = cam.transform.rotation;
-                    _continuousPitchQuatActive = true;
-                }
-
-                float deltaDeg = inputPitchRateDeg * Time.deltaTime;
-                Vector3 localRightAxis = _continuousPitchQuat * Vector3.right;
-                _continuousPitchQuat = Quaternion.AngleAxis(deltaDeg, localRightAxis) * _continuousPitchQuat;
-                cam.transform.rotation = _continuousPitchQuat;
-            }
-            else
-            {
-                _continuousPitchQuatActive = false;
-            }
+                cam.camPitch += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
         }
     }
 
