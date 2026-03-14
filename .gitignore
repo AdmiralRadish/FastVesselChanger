@@ -27,5 +27,6 @@ GameData/*/Plugins/*.pdb
 # Rider
 .idea/
 *.htm
+KSP.log
 
 StagingBlocker.netkan
