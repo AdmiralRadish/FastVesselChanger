@@ -378,6 +378,13 @@ public class FastVesselChanger : MonoBehaviour
     private float cameraRotYRate = 10f;  // orbit deg/s (positive = right)
     private string cameraRotXText = "0";
     private string cameraRotYText = "10";
+    private const float EXPANDED_MIN_PITCH = -1000f;
+    private const float EXPANDED_MAX_PITCH = 1000f;
+
+    // Widened pitch limits — cached originals restored when auto-rotation is disabled
+    private bool _pitchLimitsWidened = false;
+    private float _origMinPitch = float.NaN;
+    private float _origMaxPitch = float.NaN;
 
     // Static: survives addon destruction/recreation during vessel switches.
     // Used to carry randomized rates past scenario reloads (which restore on-disk values).
@@ -736,12 +743,22 @@ public class FastVesselChanger : MonoBehaviour
             var cam = FlightCamera.fetch;
             if (cam != null)
             {
+                // Ensure limits are widened even if cam was null when the button was pressed
+                if (!_pitchLimitsWidened)
+                    WidenPitchLimits();
+                else
+                {
+                    cam.minPitch = EXPANDED_MIN_PITCH;
+                    cam.maxPitch = EXPANDED_MAX_PITCH;
+                }
+
                 if (cameraRotYRate != 0f)
                     cam.camHdg += cameraRotYRate * Mathf.Deg2Rad * Time.deltaTime;
                 if (cameraRotXRate != 0f)
-                    cam.camPitch = Mathf.Clamp(
-                        cam.camPitch + cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime,
-                        cam.minPitch, cam.maxPitch);
+                {
+                    float newPitch = cam.camPitch + cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
+                    cam.camPitch = newPitch;
+                }
             }
         }
     }
@@ -960,6 +977,10 @@ public class FastVesselChanger : MonoBehaviour
             if (GUILayout.Button(cameraRotEnabled ? "Disable" : "Enable", GUILayout.Width(70)))
             {
                 cameraRotEnabled = !cameraRotEnabled;
+                if (cameraRotEnabled)
+                    WidenPitchLimits();
+                else
+                    RestorePitchLimits();
                 SaveToScenario();
             }
             GUILayout.EndHorizontal();
@@ -1661,6 +1682,38 @@ public class FastVesselChanger : MonoBehaviour
         }
     }
 
+    // Widen FlightCamera pitch limits to the full sphere so stock clamping does not block
+    // auto-rotation. Original values are cached and restored when rotation is disabled.
+    void WidenPitchLimits()
+    {
+        var cam = FlightCamera.fetch;
+        if (cam == null) return;
+        if (!_pitchLimitsWidened)
+        {
+            _origMinPitch = cam.minPitch;
+            _origMaxPitch = cam.maxPitch;
+            _pitchLimitsWidened = true;
+            Debug.Log("[FastVesselChanger] Cached pitch limits: min=" + _origMinPitch + " max=" + _origMaxPitch);
+        }
+        cam.minPitch = EXPANDED_MIN_PITCH;
+        cam.maxPitch = EXPANDED_MAX_PITCH;
+    }
+
+    void RestorePitchLimits()
+    {
+        if (!_pitchLimitsWidened) return;
+        var cam = FlightCamera.fetch;
+        if (cam != null && !float.IsNaN(_origMinPitch))
+        {
+            cam.minPitch = _origMinPitch;
+            cam.maxPitch = _origMaxPitch;
+            Debug.Log("[FastVesselChanger] Restored pitch limits: min=" + _origMinPitch + " max=" + _origMaxPitch);
+        }
+        _pitchLimitsWidened = false;
+        _origMinPitch = float.NaN;
+        _origMaxPitch = float.NaN;
+    }
+
     void OnDestroy()
     {
         bool isActiveInstance = _activeInstance == this;
@@ -1688,6 +1741,9 @@ public class FastVesselChanger : MonoBehaviour
 
         SaveToScenario(); // Save state before destroying
         SaveUserPrefs();
+
+        // Restore stock pitch limits before leaving flight scene
+        RestorePitchLimits();
 
         // Ensure UI is visible when leaving flight scene so player isn't stuck with hidden UI
         try
