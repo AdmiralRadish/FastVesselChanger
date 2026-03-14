@@ -378,6 +378,8 @@ public class FastVesselChanger : MonoBehaviour
     private float cameraRotYRate = 10f;  // orbit deg/s (positive = right)
     private string cameraRotXText = "0";
     private string cameraRotYText = "10";
+    private const float EXPANDED_MIN_PITCH = -1000f;
+    private const float EXPANDED_MAX_PITCH = 1000f;
 
     // Widened pitch limits — cached originals restored when auto-rotation is disabled
     private bool _pitchLimitsWidened = false;
@@ -744,14 +746,18 @@ public class FastVesselChanger : MonoBehaviour
                 // Ensure limits are widened even if cam was null when the button was pressed
                 if (!_pitchLimitsWidened)
                     WidenPitchLimits();
+                else
+                {
+                    cam.minPitch = EXPANDED_MIN_PITCH;
+                    cam.maxPitch = EXPANDED_MAX_PITCH;
+                }
 
                 if (cameraRotYRate != 0f)
                     cam.camHdg += cameraRotYRate * Mathf.Deg2Rad * Time.deltaTime;
                 if (cameraRotXRate != 0f)
                 {
                     float newPitch = cam.camPitch + cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
-                    // Continuous wrap-around in [-PI, PI) to avoid any pitch "wall"
-                    cam.camPitch = Mathf.Repeat(newPitch + Mathf.PI, 2f * Mathf.PI) - Mathf.PI;
+                    cam.camPitch = newPitch;
                 }
             }
         }
@@ -1689,8 +1695,8 @@ public class FastVesselChanger : MonoBehaviour
             _pitchLimitsWidened = true;
             Debug.Log("[FastVesselChanger] Cached pitch limits: min=" + _origMinPitch + " max=" + _origMaxPitch);
         }
-        cam.minPitch = -Mathf.PI;
-        cam.maxPitch =  Mathf.PI;
+        cam.minPitch = EXPANDED_MIN_PITCH;
+        cam.maxPitch = EXPANDED_MAX_PITCH;
     }
 
     void RestorePitchLimits()
