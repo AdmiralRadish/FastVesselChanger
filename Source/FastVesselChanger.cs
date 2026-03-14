@@ -412,6 +412,10 @@ public class FastVesselChanger : MonoBehaviour
     private static object _sharedAppButton = null;
     private bool _isAddingAppButton = false;
     private Coroutine _retryButtonCoroutine = null;
+    private Coroutine _cameraPitchOverrideCoroutine = null;
+    private bool _continuousPitchInitialized = false;
+    private float _continuousPitch = 0f;
+    private const float MANUAL_ARROW_PITCH_DEG_PER_SEC = 90f;
     
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
@@ -536,6 +540,10 @@ public class FastVesselChanger : MonoBehaviour
         GameEvents.onGUIApplicationLauncherReady.Add(OnGUIAppLauncherReady);
         GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnGUIAppLauncherUnreadifying);
         _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
+
+        // Apply pitch overrides at end-of-frame so stock camera clamping runs first,
+        // then we enforce continuous pitch and widened limits afterward.
+        _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
     }
 
     void CacheUIMasterController()
@@ -738,22 +746,6 @@ public class FastVesselChanger : MonoBehaviour
             }
         }
 
-        // Keep expanded pitch limits active regardless of auto-rotation state.
-        // This enables continuous manual camera input (e.g., up/down keys) in both directions.
-        {
-            var cam = FlightCamera.fetch;
-            if (cam != null)
-            {
-                if (!_pitchLimitsWidened)
-                    WidenPitchLimits();
-                else
-                {
-                    cam.minPitch = EXPANDED_MIN_PITCH;
-                    cam.maxPitch = EXPANDED_MAX_PITCH;
-                }
-            }
-        }
-
         if (cameraRotEnabled)
         {
             var cam = FlightCamera.fetch;
@@ -761,12 +753,53 @@ public class FastVesselChanger : MonoBehaviour
             {
                 if (cameraRotYRate != 0f)
                     cam.camHdg += cameraRotYRate * Mathf.Deg2Rad * Time.deltaTime;
-                if (cameraRotXRate != 0f)
-                {
-                    float newPitch = cam.camPitch + cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
-                    cam.camPitch = newPitch;
-                }
             }
+        }
+    }
+
+    IEnumerator ApplyPitchOverridesEndOfFrame()
+    {
+        while (true)
+        {
+            yield return new WaitForEndOfFrame();
+
+            var cam = FlightCamera.fetch;
+            if (cam == null)
+            {
+                _continuousPitchInitialized = false;
+                continue;
+            }
+
+            if (!_pitchLimitsWidened)
+                WidenPitchLimits();
+            else
+            {
+                cam.minPitch = EXPANDED_MIN_PITCH;
+                cam.maxPitch = EXPANDED_MAX_PITCH;
+            }
+
+            if (!_continuousPitchInitialized)
+            {
+                _continuousPitch = cam.camPitch;
+                _continuousPitchInitialized = true;
+            }
+
+            float pitchDelta = 0f;
+            if (cameraRotEnabled && cameraRotXRate != 0f)
+                pitchDelta += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
+
+            float manualStep = MANUAL_ARROW_PITCH_DEG_PER_SEC * Mathf.Deg2Rad * Time.deltaTime;
+            if (Input.GetKey(KeyCode.UpArrow))
+                pitchDelta += manualStep;
+            if (Input.GetKey(KeyCode.DownArrow))
+                pitchDelta -= manualStep;
+
+            if (pitchDelta != 0f)
+                _continuousPitch += pitchDelta;
+            else
+                _continuousPitch = cam.camPitch;
+
+            cam.camPitch = _continuousPitch;
         }
     }
 
@@ -1733,6 +1766,12 @@ public class FastVesselChanger : MonoBehaviour
         {
             StopCoroutine(_retryButtonCoroutine);
             _retryButtonCoroutine = null;
+        }
+
+        if (_cameraPitchOverrideCoroutine != null)
+        {
+            StopCoroutine(_cameraPitchOverrideCoroutine);
+            _cameraPitchOverrideCoroutine = null;
         }
 
         if (!isActiveInstance)
