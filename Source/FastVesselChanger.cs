@@ -750,14 +750,8 @@ public class FastVesselChanger : MonoBehaviour
                 if (cameraRotXRate != 0f)
                 {
                     float newPitch = cam.camPitch + cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
-                    if (newPitch < cam.minPitch || newPitch > cam.maxPitch)
-                    {
-                        cameraRotXRate = -cameraRotXRate;
-                        cameraRotXText = cameraRotXRate.ToString("F1");
-                        newPitch = Mathf.Clamp(newPitch, cam.minPitch, cam.maxPitch);
-                        SaveToScenario();
-                    }
-                    cam.camPitch = newPitch;
+                    // Continuous wrap-around in [-PI, PI) to avoid any pitch "wall"
+                    cam.camPitch = Mathf.Repeat(newPitch + Mathf.PI, 2f * Mathf.PI) - Mathf.PI;
                 }
             }
         }
