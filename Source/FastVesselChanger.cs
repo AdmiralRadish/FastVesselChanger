@@ -413,9 +413,6 @@ public class FastVesselChanger : MonoBehaviour
     private bool _isAddingAppButton = false;
     private Coroutine _retryButtonCoroutine = null;
     private Coroutine _cameraPitchOverrideCoroutine = null;
-    private bool _continuousPitchInitialized = false;
-    private float _continuousPitch = 0f;
-    private const float MANUAL_ARROW_PITCH_DEG_PER_SEC = 90f;
     
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
@@ -541,8 +538,9 @@ public class FastVesselChanger : MonoBehaviour
         GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnGUIAppLauncherUnreadifying);
         _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
 
-        // Apply pitch overrides at end-of-frame so stock camera clamping runs first,
-        // then we enforce continuous pitch and widened limits afterward.
+        // Apply camera pitch handling at end-of-frame so stock camera clamping runs first,
+        // then we enforce widened limits and optional X auto-rotation without overriding
+        // stock keyboard controls.
         _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
     }
 
@@ -764,11 +762,7 @@ public class FastVesselChanger : MonoBehaviour
             yield return new WaitForEndOfFrame();
 
             var cam = FlightCamera.fetch;
-            if (cam == null)
-            {
-                _continuousPitchInitialized = false;
-                continue;
-            }
+            if (cam == null) continue;
 
             if (!_pitchLimitsWidened)
                 WidenPitchLimits();
@@ -778,28 +772,8 @@ public class FastVesselChanger : MonoBehaviour
                 cam.maxPitch = EXPANDED_MAX_PITCH;
             }
 
-            if (!_continuousPitchInitialized)
-            {
-                _continuousPitch = cam.camPitch;
-                _continuousPitchInitialized = true;
-            }
-
-            float pitchDelta = 0f;
             if (cameraRotEnabled && cameraRotXRate != 0f)
-                pitchDelta += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
-
-            float manualStep = MANUAL_ARROW_PITCH_DEG_PER_SEC * Mathf.Deg2Rad * Time.deltaTime;
-            if (Input.GetKey(KeyCode.UpArrow))
-                pitchDelta += manualStep;
-            if (Input.GetKey(KeyCode.DownArrow))
-                pitchDelta -= manualStep;
-
-            if (pitchDelta != 0f)
-                _continuousPitch += pitchDelta;
-            else
-                _continuousPitch = cam.camPitch;
-
-            cam.camPitch = _continuousPitch;
+                cam.camPitch += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
         }
     }
 
