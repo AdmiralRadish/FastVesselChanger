@@ -381,7 +381,7 @@ public class FastVesselChanger : MonoBehaviour
     private const float EXPANDED_MIN_PITCH = -1000f;
     private const float EXPANDED_MAX_PITCH = 1000f;
 
-    // Widened pitch limits — cached originals restored when auto-rotation is disabled
+    // Widened pitch limits — cached originals restored when leaving flight
     private bool _pitchLimitsWidened = false;
     private float _origMinPitch = float.NaN;
     private float _origMaxPitch = float.NaN;
@@ -738,12 +738,12 @@ public class FastVesselChanger : MonoBehaviour
             }
         }
 
-        if (cameraRotEnabled)
+        // Keep expanded pitch limits active regardless of auto-rotation state.
+        // This enables continuous manual camera input (e.g., up/down keys) in both directions.
         {
             var cam = FlightCamera.fetch;
             if (cam != null)
             {
-                // Ensure limits are widened even if cam was null when the button was pressed
                 if (!_pitchLimitsWidened)
                     WidenPitchLimits();
                 else
@@ -751,7 +751,14 @@ public class FastVesselChanger : MonoBehaviour
                     cam.minPitch = EXPANDED_MIN_PITCH;
                     cam.maxPitch = EXPANDED_MAX_PITCH;
                 }
+            }
+        }
 
+        if (cameraRotEnabled)
+        {
+            var cam = FlightCamera.fetch;
+            if (cam != null)
+            {
                 if (cameraRotYRate != 0f)
                     cam.camHdg += cameraRotYRate * Mathf.Deg2Rad * Time.deltaTime;
                 if (cameraRotXRate != 0f)
@@ -977,10 +984,6 @@ public class FastVesselChanger : MonoBehaviour
             if (GUILayout.Button(cameraRotEnabled ? "Disable" : "Enable", GUILayout.Width(70)))
             {
                 cameraRotEnabled = !cameraRotEnabled;
-                if (cameraRotEnabled)
-                    WidenPitchLimits();
-                else
-                    RestorePitchLimits();
                 SaveToScenario();
             }
             GUILayout.EndHorizontal();
@@ -1682,8 +1685,8 @@ public class FastVesselChanger : MonoBehaviour
         }
     }
 
-    // Widen FlightCamera pitch limits to the full sphere so stock clamping does not block
-    // auto-rotation. Original values are cached and restored when rotation is disabled.
+    // Widen FlightCamera pitch limits so stock clamping does not block continuous rotation.
+    // Original values are cached and restored when this addon unloads.
     void WidenPitchLimits()
     {
         var cam = FlightCamera.fetch;
