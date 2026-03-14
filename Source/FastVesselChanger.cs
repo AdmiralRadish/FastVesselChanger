@@ -415,7 +415,13 @@ public class FastVesselChanger : MonoBehaviour
     private bool _isAddingAppButton = false;
     private Coroutine _retryButtonCoroutine = null;
     private Coroutine _cameraPitchOverrideCoroutine = null;
-    
+
+    // Twitch overlay file writer
+    private Coroutine _twitchFileWriterCoroutine = null;
+    private const string TWITCH_PLAYERS_FILE = "players_online.txt";
+    private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
+    private const float TWITCH_WRITE_INTERVAL = 15f;
+
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
 
@@ -544,6 +550,7 @@ public class FastVesselChanger : MonoBehaviour
         // then we enforce widened limits and optional X auto-rotation without overriding
         // stock keyboard controls.
         _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
+        _twitchFileWriterCoroutine = StartCoroutine(TwitchFileWriterCoroutine());
     }
 
     void CacheUIMasterController()
@@ -1746,6 +1753,12 @@ public class FastVesselChanger : MonoBehaviour
             _cameraPitchOverrideCoroutine = null;
         }
 
+        if (_twitchFileWriterCoroutine != null)
+        {
+            StopCoroutine(_twitchFileWriterCoroutine);
+            _twitchFileWriterCoroutine = null;
+        }
+
         if (!isActiveInstance)
         {
             Debug.Log("[FastVesselChanger] Skipping persistence for duplicate destroyed flight addon instance.");
@@ -1768,6 +1781,122 @@ public class FastVesselChanger : MonoBehaviour
         catch { }
         
         RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
+    }
+
+    // -------------------------------------------------------------------------
+    // Twitch overlay support
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Coroutine that writes two overlay text files to &lt;PluginData&gt; every 15 seconds:
+    ///   players_online.txt  – LunaMultiplayer connected players ("Streamer" excluded)
+    ///   current_vessel.txt  – active vessel name + situation line
+    /// </summary>
+    IEnumerator TwitchFileWriterCoroutine()
+    {
+        while (true)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(GetUserPrefsPath());
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+
+                // --- players_online.txt ---
+                var players = GetLMPPlayerNames();
+                File.WriteAllText(
+                    Path.Combine(dir, TWITCH_PLAYERS_FILE),
+                    players.Count > 0 ? string.Join(Environment.NewLine, players) : string.Empty);
+
+                // --- current_vessel.txt ---
+                var v = FlightGlobals.ActiveVessel;
+                string vesselLine  = v != null ? v.vesselName : "";
+                string statusLine  = v != null ? GetVesselSituationText(v) : "";
+                File.WriteAllText(
+                    Path.Combine(dir, TWITCH_VESSEL_FILE),
+                    vesselLine + Environment.NewLine + statusLine);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[FastVesselChanger] TwitchFileWriter error: " + e.Message);
+            }
+
+            yield return new WaitForSeconds(TWITCH_WRITE_INTERVAL);
+        }
+    }
+
+    /// <summary>
+    /// Returns the names of all players currently connected to the LunaMultiplayer server,
+    /// excluding the reserved name "Streamer". Returns an empty list in single-player mode.
+    /// Uses reflection so there is no hard dependency on LMP DLLs.
+    /// </summary>
+    List<string> GetLMPPlayerNames()
+    {
+        var players = new List<string>();
+        if (!FVCLunaHelper.IsLunaEnabled)
+            return players;
+
+        try
+        {
+            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type statusType = a.GetType("LunaMultiplayer.Client.Systems.Status.StatusSystem")
+                               ?? a.GetType("LMP.Client.Systems.Status.StatusSystem");
+                if (statusType == null) continue;
+
+                // Singleton may be called Singleton or Instance depending on LMP version
+                PropertyInfo singletonProp =
+                    statusType.GetProperty("Singleton", BindingFlags.Public | BindingFlags.Static)
+                 ?? statusType.GetProperty("Instance",  BindingFlags.Public | BindingFlags.Static);
+                if (singletonProp == null) break;
+
+                var singleton = singletonProp.GetValue(null);
+                if (singleton == null) break;
+
+                var listProp = singleton.GetType().GetProperty(
+                    "PlayerStatusList", BindingFlags.Public | BindingFlags.Instance);
+                if (listProp == null) break;
+
+                var dict = listProp.GetValue(singleton) as IDictionary;
+                if (dict == null) break;
+
+                foreach (var key in dict.Keys)
+                {
+                    string name = key.ToString();
+                    if (!string.Equals(name, "Streamer", StringComparison.OrdinalIgnoreCase))
+                        players.Add(name);
+                }
+                break;
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] GetLMPPlayerNames error: " + e.Message);
+        }
+
+        return players;
+    }
+
+    /// <summary>
+    /// Returns a human-readable vessel situation string suitable for Twitch overlays.
+    /// Examples: "Orbiting Kerbin", "On escape trajectory from Kerbin", "Landed on Mun".
+    /// </summary>
+    string GetVesselSituationText(Vessel v)
+    {
+        if (v == null) return "";
+        string body = v.mainBody?.bodyName ?? "Unknown";
+        switch (v.situation)
+        {
+            case Vessel.Situations.LANDED:      return "Landed on " + body;
+            case Vessel.Situations.SPLASHED:    return "Splashed down on " + body;
+            case Vessel.Situations.PRELAUNCH:   return "Pre-launch at " + body;
+            case Vessel.Situations.FLYING:      return "Flying over " + body;
+            case Vessel.Situations.SUB_ORBITAL: return "Sub-orbital flight over " + body;
+            case Vessel.Situations.ORBITING:    return "Orbiting " + body;
+            case Vessel.Situations.ESCAPING:    return "On escape trajectory from " + body;
+            case Vessel.Situations.DOCKED:      return "Docked";
+            default:                            return v.situation.ToString();
+        }
     }
 
     void RemoveAppLauncherButton(string source, bool forceClearShared)
