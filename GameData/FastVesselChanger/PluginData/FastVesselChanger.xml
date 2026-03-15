@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FastVesselChangerUserPrefs>
+  <ShowCameraControls>False</ShowCameraControls>
+  <ShowTypeFilter>False</ShowTypeFilter>
+  <TypeFilters>
+    <Filter name="Ship" />
+    <Filter name="Station" />
+    <Filter name="Probe" />
+    <Filter name="Lander" />
+    <Filter name="Rover" />
+    <Filter name="Plane" />
+    <Filter name="Relay" />
+  </TypeFilters>
+  <Window x="20" y="80" width="400" height="500" />
+  <WriteLMPPlayersLog>False</WriteLMPPlayersLog>
+  <WriteVesselLog>False</WriteVesselLog>
+</FastVesselChangerUserPrefs>

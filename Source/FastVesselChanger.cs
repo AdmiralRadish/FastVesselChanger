@@ -12,7 +12,6 @@ using UnityEngine;
 
 /// <summary>
 /// Helper class to detect and interact with LunaMultiplayer server
-/// Uses reflection to avoid hard dependency on Luna DLLs
 /// Prefixed FVC to avoid type-name collision with identically-named helpers
 /// in other KSP mods loaded into the same AppDomain.
 /// </summary>
@@ -44,7 +43,10 @@ public static class FVCLunaHelper
             foreach (var a in assemblies)
             {
                 // Look for LunaMultiplayer assemblies
-                if (a.GetName().Name.Contains("LunaMultiplayer") || a.GetName().Name == "LMP.Client")
+                var assemblyName = a.GetName().Name ?? string.Empty;
+                if (assemblyName.IndexOf("LunaMultiplayer", StringComparison.OrdinalIgnoreCase) >= 0
+                    || assemblyName.Equals("LMP.Client", StringComparison.OrdinalIgnoreCase)
+                    || assemblyName.Equals("LmpClient", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
@@ -61,13 +63,20 @@ public static class FVCLunaHelper
     public static string GetCurrentPlayerName()
     {
         if (_cachedPlayerName != null)
-            return _cachedPlayerName;
+        {
+            if (!string.Equals(_cachedPlayerName, "SinglePlayer", StringComparison.OrdinalIgnoreCase) || !IsLunaEnabled)
+                return _cachedPlayerName;
+
+            // If Luna is enabled and we previously fell back to SinglePlayer,
+            // retry resolution because the client may not have been fully initialized yet.
+            _cachedPlayerName = null;
+        }
 
         try
         {
             if (IsLunaEnabled)
             {
-                // Try to get from LunaMultiplayer.Client.Main.MyPlayer.PlayerName
+                // Strategy 1: Try Main.MyPlayer.PlayerName
                 var assemblies = AppDomain.CurrentDomain.GetAssemblies();
                 Type mainType = null;
 
@@ -87,18 +96,65 @@ public static class FVCLunaHelper
                         var myPlayer = myPlayerProp.GetValue(null);
                         if (myPlayer != null)
                         {
-                            // Get PlayerName property
-                            var playerNameProp = myPlayer.GetType().GetProperty("PlayerName", BindingFlags.Public | BindingFlags.Instance);
-                            if (playerNameProp != null)
+                            string? resolvedName = ExtractStringMember(myPlayer, "PlayerName")
+                                                ?? ExtractStringMember(myPlayer, "Name")
+                                                ?? ExtractStringMember(myPlayer, "UserName")
+                                                ?? ExtractStringMember(myPlayer, "Username");
+                            if (!string.IsNullOrWhiteSpace(resolvedName))
                             {
-                                var playerName = playerNameProp.GetValue(myPlayer) as string;
-                                if (!string.IsNullOrEmpty(playerName))
+                                _cachedPlayerName = SanitizePlayerName(resolvedName!);
+                                Debug.Log("[FastVesselChanger] Detected Luna player: " + _cachedPlayerName);
+                                return _cachedPlayerName;
+                            }
+                        }
+                    }
+                }
+
+                // Strategy 2: Try SettingsSystem.CurrentSettings.PlayerName (LMP client source of truth)
+                foreach (var a in assemblies)
+                {
+                    Type settingsType = a.GetType("LmpClient.Systems.SettingsSys.SettingsSystem")
+                                      ?? a.GetType("LMP.Client.Systems.Settings.SettingsSystem")
+                                      ?? a.GetType("LunaMultiplayer.Client.Systems.SettingsSys.SettingsSystem");
+                    if (settingsType == null) continue;
+
+                    object? currentSettings = null;
+                    var currentSettingsProp = settingsType.GetProperty("CurrentSettings", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                    if (currentSettingsProp != null)
+                    {
+                        try { currentSettings = currentSettingsProp.GetValue(null, null); } catch { }
+                    }
+
+                    if (currentSettings == null)
+                    {
+                        var singletonProp = settingsType.GetProperty("Singleton", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
+                                        ?? settingsType.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                        if (singletonProp != null)
+                        {
+                            object? singleton = null;
+                            try { singleton = singletonProp.GetValue(null, null); } catch { }
+                            if (singleton != null)
+                            {
+                                var instanceCurrentSettings = singleton.GetType().GetProperty("CurrentSettings", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+                                if (instanceCurrentSettings != null)
                                 {
-                                    _cachedPlayerName = SanitizePlayerName(playerName!);
-                                    Debug.Log("[FastVesselChanger] Detected Luna player: " + _cachedPlayerName);
-                                    return _cachedPlayerName;
+                                    try { currentSettings = instanceCurrentSettings.GetValue(singleton, null); } catch { }
                                 }
                             }
+                        }
+                    }
+
+                    if (currentSettings != null)
+                    {
+                        string? resolvedName = ExtractStringMember(currentSettings, "PlayerName")
+                                            ?? ExtractStringMember(currentSettings, "Name")
+                                            ?? ExtractStringMember(currentSettings, "UserName")
+                                            ?? ExtractStringMember(currentSettings, "Username");
+                        if (!string.IsNullOrWhiteSpace(resolvedName))
+                        {
+                            _cachedPlayerName = SanitizePlayerName(resolvedName!);
+                            Debug.Log("[FastVesselChanger] Detected Luna player (settings): " + _cachedPlayerName);
+                            return _cachedPlayerName;
                         }
                     }
                 }
@@ -109,9 +165,33 @@ public static class FVCLunaHelper
             Debug.LogWarning("[FastVesselChanger] Error detecting Luna player name: " + e.Message);
         }
 
-        // Fallback to single-player mode
-        _cachedPlayerName = "SinglePlayer";
-        return _cachedPlayerName;
+        // Fallback to single-player mode. Only cache this when Luna is not enabled,
+        // so we keep retrying player detection while Luna initializes.
+        if (!IsLunaEnabled)
+            _cachedPlayerName = "SinglePlayer";
+
+        return "SinglePlayer";
+    }
+
+    private static string? ExtractStringMember(object source, string memberName)
+    {
+        if (source == null || string.IsNullOrEmpty(memberName))
+            return null;
+
+        var type = source.GetType();
+        var prop = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (prop != null && prop.PropertyType == typeof(string))
+        {
+            try { return prop.GetValue(source, null) as string; } catch { }
+        }
+
+        var field = type.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (field != null && field.FieldType == typeof(string))
+        {
+            try { return field.GetValue(source) as string; } catch { }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -157,10 +237,11 @@ public class FastVesselChangerScenario : ScenarioModule
     public bool cameraRotEnabled = false;
     public bool cameraRotRandomEnabled = false;
     public float cameraRotXRate = 0f;   // pitch deg/s (positive = up)
-    public float cameraRotYRate = 10f;  // orbit deg/s (positive = right)
-    public bool zoomTrackingEnabled = true;
+    public float cameraRotYRate = 0f;   // orbit deg/s (positive = right)
     public List<string> selectedVesselIds = new List<string>();
     public List<string> selectedVesselTypes = new List<string>();
+    public List<string> shuffleRemainingVesselIds = new List<string>();
+    public List<string> vesselZoomEntries = new List<string>();
 
     public static FastVesselChangerScenario Instance { get; private set; }
 
@@ -202,7 +283,6 @@ public class FastVesselChangerScenario : ScenarioModule
             node.SetValue(MakePlayerKey("cameraRotRandomEnabled"), cameraRotRandomEnabled.ToString(), true);
             node.SetValue(MakePlayerKey("cameraRotXRate"), cameraRotXRate.ToString(), true);
             node.SetValue(MakePlayerKey("cameraRotYRate"), cameraRotYRate.ToString(), true);
-            node.SetValue(MakePlayerKey("zoomTrackingEnabled"), zoomTrackingEnabled.ToString(), true);
 
             // Save vessel selections (each as a separate value)
             string vesselIdPrefix = MakePlayerKey("selectedVesselId");
@@ -216,6 +296,20 @@ public class FastVesselChangerScenario : ScenarioModule
             foreach (var type in selectedVesselTypes)
             {
                 node.AddValue(vesselTypePrefix, type);
+            }
+
+            // Save shuffle-bag remainder so vessel-switch reloads keep the current round intact
+            string shuffleRemainingPrefix = MakePlayerKey("shuffleRemainingVesselId");
+            foreach (var id in shuffleRemainingVesselIds)
+            {
+                node.AddValue(shuffleRemainingPrefix, id);
+            }
+
+            // Save per-vessel zoom levels
+            string vesselZoomPrefix = MakePlayerKey("vesselZoom");
+            foreach (var entry in vesselZoomEntries)
+            {
+                node.AddValue(vesselZoomPrefix, entry);
             }
 
             Debug.Log("[FastVesselChanger] Saved settings for player: " + playerPrefix);
@@ -233,6 +327,8 @@ public class FastVesselChangerScenario : ScenarioModule
         {
             selectedVesselIds.Clear();
             selectedVesselTypes.Clear();
+            shuffleRemainingVesselIds.Clear();
+            vesselZoomEntries.Clear();
             
             string playerPrefix = GetPlayerKey();
 
@@ -268,9 +364,6 @@ public class FastVesselChangerScenario : ScenarioModule
             string camRotYKey = MakePlayerKey("cameraRotYRate");
             if (node.HasValue(camRotYKey))
                 float.TryParse(node.GetValue(camRotYKey), out cameraRotYRate);
-            string zoomTrackKey = MakePlayerKey("zoomTrackingEnabled");
-            if (node.HasValue(zoomTrackKey))
-                bool.TryParse(node.GetValue(zoomTrackKey), out zoomTrackingEnabled);
 
             // Load vessel selections
             string vesselIdPrefix = MakePlayerKey("selectedVesselId");
@@ -286,8 +379,22 @@ public class FastVesselChangerScenario : ScenarioModule
                 if (!string.IsNullOrEmpty(t)) selectedVesselTypes.Add(t);
             }
 
+            // Load shuffle-bag remainder
+            string shuffleRemainingPrefix = MakePlayerKey("shuffleRemainingVesselId");
+            foreach (var id in node.GetValues(shuffleRemainingPrefix))
+            {
+                if (!string.IsNullOrEmpty(id)) shuffleRemainingVesselIds.Add(id);
+            }
+
+            // Load per-vessel zoom levels
+            string vesselZoomPrefix = MakePlayerKey("vesselZoom");
+            foreach (var z in node.GetValues(vesselZoomPrefix))
+            {
+                if (!string.IsNullOrEmpty(z)) vesselZoomEntries.Add(z);
+            }
+
             Debug.Log("[FastVesselChanger] Loaded settings for player: " + playerPrefix + 
-                     " (vessels: " + selectedVesselIds.Count + ", types: " + selectedVesselTypes.Count + ")");
+                     " (vessels: " + selectedVesselIds.Count + ", types: " + selectedVesselTypes.Count + ", remaining: " + shuffleRemainingVesselIds.Count + ", zooms: " + vesselZoomEntries.Count + ")");
         }
         catch (Exception e)
         {
@@ -373,15 +480,17 @@ public class FastVesselChanger : MonoBehaviour
     // Camera auto-rotation
     private bool cameraRotEnabled = false;
     private bool cameraRotRandomEnabled = false; // randomize X/Y rates on each vessel switch
-    private bool zoomTrackingEnabled = false;
     private float cameraRotXRate = 0f;   // pitch deg/s (positive = up)
-    private float cameraRotYRate = 10f;  // orbit deg/s (positive = right)
+    private float cameraRotYRate = 0f;   // orbit deg/s (positive = right)
     private string cameraRotXText = "0";
-    private string cameraRotYText = "10";
+    private string cameraRotYText = "0";
     private const float EXPANDED_MIN_PITCH = -100000f;
     private const float EXPANDED_MAX_PITCH = 100000f;
     private const float CAMERA_LOWER_POLE = -1.5707964f;
     private const float CAMERA_POLE_WRAP_THRESHOLD = 0.0005f;
+    // Grounded vessels can collide/pivot before reaching the true lower pole; use earlier handoff.
+    private const float CAMERA_LOWER_HANDOFF_GROUNDED = -0.10f;
+    private bool _downGroundBypassLatched = false;
 
     // Widened pitch limits — cached originals restored when leaving flight
     private bool _pitchLimitsWidened = false;
@@ -400,7 +509,12 @@ public class FastVesselChanger : MonoBehaviour
     private static Guid _pendingZoomVesselId = Guid.Empty;
     private static float _pendingZoom = 0f;
     private static int _zoomRestoreFrames = 0;
+    private static float _pendingZoomDeadlineRealtime = 0f;
+    private static Guid _zoomLockoutVesselId = Guid.Empty;
+    private static float _zoomLockoutTarget = 0f;
+    private static float _zoomLockoutUntilRealtime = 0f;
     private static FieldInfo _camDistField = null; // cached reflection handle
+    private const float ZOOM_LOCKOUT_SECONDS = 2.0f;
 
     // Cached reflection handles for UIMasterController (the class that actually hides/shows KSP's HUD)
     private object _uiMasterInstance = null;
@@ -418,6 +532,10 @@ public class FastVesselChanger : MonoBehaviour
 
     // Twitch overlay file writer
     private Coroutine _twitchFileWriterCoroutine = null;
+    private bool _twitchWriterStartupLogged = false;
+    private bool _writeLMPPlayersLog = false;  // persist to XML user prefs
+    private bool _writeVesselLog = false;      // persist to XML user prefs
+    private static readonly bool VERBOSE_DIAGNOSTICS = false;
     private const string TWITCH_PLAYERS_FILE = "players_online.txt";
     private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
     private const float TWITCH_WRITE_INTERVAL = 15f;
@@ -435,6 +553,17 @@ public class FastVesselChanger : MonoBehaviour
         }
 
         _activeInstance = this;
+    }
+
+    void VerboseLog(string message, bool warning = false)
+    {
+        if (VERBOSE_DIAGNOSTICS)
+        {
+            if (warning)
+                Debug.LogWarning(message);
+            else
+                Debug.Log(message);
+        }
     }
 
     void Start()
@@ -488,7 +617,6 @@ public class FastVesselChanger : MonoBehaviour
                 cameraRotYRate = scen.cameraRotYRate;
                 cameraRotXText = cameraRotXRate.ToString("F1");
                 cameraRotYText = cameraRotYRate.ToString("F1");
-                zoomTrackingEnabled = scen.zoomTrackingEnabled;
                 // Window position and local filter prefs are loaded from the XML user prefs in LoadUserPrefs().
                 selected.Clear();
                 foreach (var id in scen.selectedVesselIds)
@@ -499,6 +627,20 @@ public class FastVesselChanger : MonoBehaviour
                         selected[g] = true;
                     }
                     catch { }
+                }
+
+                _vesselZooms.Clear();
+                foreach (var entry in scen.vesselZoomEntries)
+                {
+                    if (string.IsNullOrEmpty(entry)) continue;
+                    var parts = entry.Split('|');
+                    if (parts.Length != 2) continue;
+
+                    Guid vesselId;
+                    float zoom;
+                    if (!Guid.TryParse(parts[0], out vesselId)) continue;
+                    if (!float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out zoom)) continue;
+                    _vesselZooms[vesselId] = zoom;
                 }
 
                 if (!_loadedTypeFiltersFromUserPrefs && scen.selectedVesselTypes.Count > 0)
@@ -513,6 +655,11 @@ public class FastVesselChanger : MonoBehaviour
         {
             Debug.LogError("[FastVesselChanger] Error loading scenario data: " + e.Message);
         }
+
+        // Rebuild the selected vessel pool every time the flight addon is recreated,
+        // then restore the remaining shuffle bag from scenario storage if present.
+        BuildCycleList(resetShuffleBag: false);
+        RestoreShuffleBagFromScenario(FastVesselChangerScenario.Instance);
 
         // If a vessel switch produced randomized rates, apply them now — after scenario load,
         // so they override whatever the scenario restored from the on-disk ConfigNode.
@@ -677,6 +824,7 @@ public class FastVesselChanger : MonoBehaviour
                 camForLimits.minPitch = EXPANDED_MIN_PITCH;
                 camForLimits.maxPitch = EXPANDED_MAX_PITCH;
             }
+
         }
 
         // Track F2 via Unity's input system. KSP's UIMasterController also handles F2 on its own,
@@ -712,11 +860,20 @@ public class FastVesselChanger : MonoBehaviour
             }
         }
 
-        // Zoom restore — runs every frame until the distance sticks or the counter expires
+        // Zoom restore — pre-seed as soon as target is active, then hard-lock briefly
+        // to suppress transition-time camera systems from overriding the restore.
         if (_zoomRestoreFrames > 0 && _pendingZoomVesselId != Guid.Empty)
         {
+            if (Time.realtimeSinceStartup > _pendingZoomDeadlineRealtime)
+            {
+                VerboseLog("[FastVesselChanger] RestoreZoom timeout: target vessel did not become ready before deadline", warning: true);
+                _pendingZoomVesselId = Guid.Empty;
+                _zoomRestoreFrames = 0;
+                _pendingZoomDeadlineRealtime = 0f;
+            }
+
             var activeVessel = FlightGlobals.ActiveVessel;
-            if (activeVessel != null && activeVessel.id == _pendingZoomVesselId)
+            if (_pendingZoomVesselId != Guid.Empty && activeVessel != null && activeVessel.id == _pendingZoomVesselId)
             {
                 var cam = FlightCamera.fetch;
                 if (cam != null)
@@ -729,40 +886,73 @@ public class FastVesselChanger : MonoBehaviour
                         // First time: log all distance-related float fields so we can verify the right name
                         foreach (var f in cam.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                             if (f.FieldType == typeof(float) && f.Name.ToLower().Contains("dist"))
-                                Debug.Log("[FastVesselChanger] FlightCamera float field: " + f.Name + " = " + f.GetValue(cam));
+                                VerboseLog("[FastVesselChanger] FlightCamera float field: " + f.Name + " = " + f.GetValue(cam));
                     }
 
                     // Log on the very first frame so we can see what's available
                     if (_zoomRestoreFrames == 240)
-                        Debug.Log("[FastVesselChanger] RestoreZoom start: target=" + _pendingZoom
+                        VerboseLog("[FastVesselChanger] RestoreZoom start: target=" + _pendingZoom
                             + " current=" + cam.Distance
                             + " camDistField=" + (_camDistField != null ? _camDistField.Name : "NOT FOUND"));
 
+                    // Option A: pre-seed immediately when the target vessel becomes active.
                     cam.SetDistanceImmediate(_pendingZoom);
                     _camDistField?.SetValue(cam, _pendingZoom);
-                    _zoomRestoreFrames--;
-                    if (_zoomRestoreFrames == 0)
-                    {
-                        Debug.Log("[FastVesselChanger] RestoreZoom done: final Distance=" + cam.Distance);
-                        _pendingZoomVesselId = Guid.Empty;
-                    }
+                    VerboseLog("[FastVesselChanger] RestoreZoom pre-seed applied: target=" + _pendingZoom + " final=" + cam.Distance);
+
+                    // Option C: aggressive lockout window — keep forcing zoom to block user scroll
+                    // and other camera writers during the immediate post-load transition.
+                    _zoomLockoutVesselId = _pendingZoomVesselId;
+                    _zoomLockoutTarget = _pendingZoom;
+                    _zoomLockoutUntilRealtime = Time.realtimeSinceStartup + ZOOM_LOCKOUT_SECONDS;
+                    VerboseLog("[FastVesselChanger] RestoreZoom lockout started: seconds=" + ZOOM_LOCKOUT_SECONDS.ToString("F1") + " target=" + _zoomLockoutTarget);
+
+                    // Pending restore is consumed; lockout enforces the value for a short window.
+                    _pendingZoomVesselId = Guid.Empty;
+                    _zoomRestoreFrames = 0;
+                    _pendingZoomDeadlineRealtime = 0f;
                 }
                 else
                 {
-                    // cam null — decrement so we don't stall forever, log once
+                    // Camera not ready yet — keep waiting until realtime deadline.
                     if (_zoomRestoreFrames == 240)
-                        Debug.LogWarning("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null on frame 240");
-                    _zoomRestoreFrames--;
+                        VerboseLog("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null on frame 240", warning: true);
                 }
             }
             else
             {
                 // Vessel transition still in progress — FlightGlobals.ActiveVessel lags behind
-                // SetActiveVessel by several frames. Don't cancel; let the counter expire naturally
-                // so the restore fires as soon as the new vessel becomes active.
-                _zoomRestoreFrames--;
-                if (_zoomRestoreFrames == 0)
-                    _pendingZoomVesselId = Guid.Empty;
+                // SetActiveVessel by several frames (or longer on heavily modded installs).
+                // Keep the restore request pending until the target vessel is actually active,
+                // bounded by the realtime deadline set when the request is queued.
+                VerboseLog("[FastVesselChanger] RestoreZoom waiting: active="
+                    + (activeVessel != null ? activeVessel.id.ToString() : "null")
+                    + " target=" + _pendingZoomVesselId.ToString());
+            }
+        }
+
+        // During lockout we aggressively force zoom every frame for the target vessel.
+        if (_zoomLockoutUntilRealtime > 0f && _zoomLockoutVesselId != Guid.Empty)
+        {
+            if (Time.realtimeSinceStartup > _zoomLockoutUntilRealtime)
+            {
+                VerboseLog("[FastVesselChanger] RestoreZoom lockout ended");
+                _zoomLockoutVesselId = Guid.Empty;
+                _zoomLockoutTarget = 0f;
+                _zoomLockoutUntilRealtime = 0f;
+            }
+            else
+            {
+                var lockoutVessel = FlightGlobals.ActiveVessel;
+                if (lockoutVessel != null && lockoutVessel.id == _zoomLockoutVesselId)
+                {
+                    var lockoutCam = FlightCamera.fetch;
+                    if (lockoutCam != null)
+                    {
+                        lockoutCam.SetDistanceImmediate(_zoomLockoutTarget);
+                        _camDistField?.SetValue(lockoutCam, _zoomLockoutTarget);
+                    }
+                }
             }
         }
 
@@ -794,17 +984,46 @@ public class FastVesselChanger : MonoBehaviour
                 cam.maxPitch = EXPANDED_MAX_PITCH;
             }
 
-            // KSP hard-clamps the negative pole at -PI/2 regardless of widened minPitch.
-            // Unwrap by +2PI at the lower pole so Down input can continue smoothly with
-            // no heading flip or mirror remap.
-            bool wantsPitchDown = Input.GetKey(KeyCode.DownArrow) || (cameraRotEnabled && cameraRotXRate < 0f);
-            if (wantsPitchDown && cam.camPitch <= CAMERA_LOWER_POLE + CAMERA_POLE_WRAP_THRESHOLD)
-            {
-                cam.camPitch += 2f * Mathf.PI;
-            }
+            // Down-only ground clamp bypass. Keep stock input speed/direction behavior.
+            bool wantsPitchDownKey = Input.GetKey(KeyCode.DownArrow);
+            bool wantsPitchUpKey = Input.GetKey(KeyCode.UpArrow);
+            if (wantsPitchDownKey && !wantsPitchUpKey)
+                ApplyDownGroundBypass(cam);
+            else
+                _downGroundBypassLatched = false;
 
             if (cameraRotEnabled && cameraRotXRate != 0f)
                 cam.camPitch += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
+        }
+    }
+
+    void ApplyDownGroundBypass(FlightCamera cam)
+    {
+        if (cam == null)
+            return;
+
+        var active = FlightGlobals.ActiveVessel;
+        bool isGrounded = active != null &&
+            (active.situation == Vessel.Situations.LANDED
+             || active.situation == Vessel.Situations.SPLASHED
+             || active.situation == Vessel.Situations.PRELAUNCH);
+
+        float handoffBoundary = isGrounded
+            ? CAMERA_LOWER_HANDOFF_GROUNDED
+            : (CAMERA_LOWER_POLE + CAMERA_POLE_WRAP_THRESHOLD);
+
+        if (cam.camPitch <= handoffBoundary)
+        {
+            if (_downGroundBypassLatched)
+                return;
+
+            cam.camPitch += 2f * Mathf.PI;
+            _downGroundBypassLatched = true;
+            VerboseLog("[FastVesselChanger] Down bypass wrap applied at pitch=" + handoffBoundary + " current=" + cam.camPitch);
+        }
+        else if (cam.camPitch > handoffBoundary + 0.35f)
+        {
+            _downGroundBypassLatched = false;
         }
     }
 
@@ -833,25 +1052,20 @@ public class FastVesselChanger : MonoBehaviour
 
         // ---- Vessel List ----
         int selectedCount = selected.Values.Count(v => v);
+        GUILayout.BeginHorizontal();
         GUILayout.Label("Vessels (" + selectedCount + " selected):");
+        GUILayout.FlexibleSpace();
+        if (GUILayout.Button("Refresh", GUILayout.Width(60)))
+            RefreshSelectionsFromVessels();
+        GUILayout.EndHorizontal();
 
-        // Search bar
+        // Search bar + filter toggle
         GUILayout.BeginHorizontal();
         GUILayout.Label("Search:", GUILayout.Width(50));
         vesselSearchText = GUILayout.TextField(vesselSearchText, GUILayout.ExpandWidth(true));
         if (!string.IsNullOrEmpty(vesselSearchText) && GUILayout.Button("X", GUILayout.Width(24)))
             vesselSearchText = "";
-        GUILayout.EndHorizontal();
-
-        GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Deselect All", GUILayout.Width(100)))
-        {
-            foreach (var key in selected.Keys.ToList())
-                selected[key] = false;
-            SaveToScenario();
-            BuildCycleList();
-        }
-        if (GUILayout.Button((showTypeFilter ? "[-] " : "[+] ") + "Filter", GUILayout.ExpandWidth(true)))
+        if (GUILayout.Button((showTypeFilter ? "[-]" : "[+]") + "Filter", GUILayout.Width(62)))
         {
             showTypeFilter = !showTypeFilter;
             SaveUserPrefs();
@@ -902,30 +1116,30 @@ public class FastVesselChanger : MonoBehaviour
             }
 
             GUILayout.BeginHorizontal();
-            bool toggled = GUILayout.Toggle(prev, "");
-            if (toggled != prev)
+            if (showCameraControls)
             {
-                selected[v.id] = toggled;
-                SaveToScenario();
-                BuildCycleList();
+                bool toggled = GUILayout.Toggle(prev, "");
+                if (toggled != prev)
+                {
+                    selected[v.id] = toggled;
+                    SaveToScenario();
+                    BuildCycleList();
+                }
             }
             GUILayout.Label(v.vesselName + "  [" + v.vesselType + "]");
             GUILayout.FlexibleSpace();
             if (GUILayout.Button("GO", GUILayout.Width(30)))
             {
-                if (zoomTrackingEnabled)
+                var currentVessel = FlightGlobals.ActiveVessel;
+                if (currentVessel != null)
                 {
-                    var currentVessel = FlightGlobals.ActiveVessel;
-                    if (currentVessel != null)
-                    {
-                        var cam = FlightCamera.fetch;
-                        if (cam != null) _vesselZooms[currentVessel.id] = cam.Distance;
-                    }
+                    var cam = FlightCamera.fetch;
+                    if (cam != null) _vesselZooms[currentVessel.id] = cam.Distance;
                 }
+                shuffleRemaining.RemoveAll(sv => sv != null && sv.id == v.id);
                 SwitchToVessel(v);
                 lastSwitchedVesselId = v.id;
                 lastSwitchTime = Planetarium.GetUniversalTime();
-                shuffleRemaining.RemoveAll(sv => sv != null && sv.id == v.id);
             }
             GUILayout.EndHorizontal();
         }
@@ -949,35 +1163,41 @@ public class FastVesselChanger : MonoBehaviour
         {
             GUILayout.BeginVertical("box");
 
-            // ---- Auto Switch Controls ----
+            // ---- Vessel Selection ----
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Interval (s):", GUILayout.Width(80));
-            switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(55));
-            int parsed;
-            if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
+            if (GUILayout.Button("Select Visible", GUILayout.ExpandWidth(true)))
             {
-                double effectiveInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
-                double remaining = Math.Max(0, effectiveInterval - (Planetarium.GetUniversalTime() - lastSwitchTime));
-                if (!autoEnabled || parsed >= remaining)
+                string searchLowerSel = vesselSearchText.ToLowerInvariant();
+                foreach (Vessel sv in FlightGlobals.Vessels.Where(sv => sv != null))
                 {
-                    switchInterval = parsed;
-                    pendingInterval = -1;
+                    if (!IsVesselTypeEnabled(sv.vesselType.ToString())) continue;
+                    if (!string.IsNullOrEmpty(vesselSearchText) && !sv.vesselName.ToLowerInvariant().Contains(searchLowerSel)) continue;
+                    selected[sv.id] = true;
                 }
-                else
-                {
-                    pendingInterval = parsed;
-                }
+                SaveToScenario();
+                BuildCycleList();
             }
-            if (pendingInterval > 0)
-                GUILayout.Label("(pending)", GUILayout.ExpandWidth(false));
+            if (GUILayout.Button("Deselect All", GUILayout.ExpandWidth(true)))
+            {
+                foreach (var key in selected.Keys.ToList())
+                    selected[key] = false;
+                SaveToScenario();
+                BuildCycleList();
+            }
             GUILayout.EndHorizontal();
 
+            GUILayout.Space(4);
+
+            // ---- Auto Switch Controls ----
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button(autoEnabled ? "Stop Auto" : "Start Auto", GUILayout.Width(100)))
+            GUILayout.Label("Auto Switch:", GUILayout.Width(80));
+            if (GUILayout.Button(autoEnabled ? "ON" : "OFF", GUILayout.Width(40)))
             {
                 ToggleAuto();
             }
-            if (GUILayout.Button("Next Now", GUILayout.Width(90)))
+            GUILayout.Label("Interval:", GUILayout.Width(52));
+            switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(45));
+            if (GUILayout.Button("Next Now", GUILayout.ExpandWidth(true)))
             {
                 double ut = Planetarium.GetUniversalTime();
                 double timeSinceLastSwitch = ut - lastSwitchTime;
@@ -992,9 +1212,20 @@ public class FastVesselChanger : MonoBehaviour
                     ScreenMessages.PostScreenMessage("Wait " + timeRemaining + " more seconds before switching", 3f, ScreenMessageStyle.UPPER_CENTER);
                 }
             }
-            if (GUILayout.Button("Refresh List", GUILayout.Width(90)))
+            int parsed;
+            if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
             {
-                RefreshSelectionsFromVessels();
+                double effectiveInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+                double remaining = Math.Max(0, effectiveInterval - (Planetarium.GetUniversalTime() - lastSwitchTime));
+                if (!autoEnabled || parsed >= remaining)
+                {
+                    switchInterval = parsed;
+                    pendingInterval = -1;
+                }
+                else
+                {
+                    pendingInterval = parsed;
+                }
             }
             GUILayout.EndHorizontal();
 
@@ -1018,8 +1249,8 @@ public class FastVesselChanger : MonoBehaviour
             GUILayout.Space(6);
 
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Auto Rotation: " + (cameraRotEnabled ? "ON" : "OFF"), GUILayout.Width(150));
-            if (GUILayout.Button(cameraRotEnabled ? "Disable" : "Enable", GUILayout.Width(70)))
+            GUILayout.Label("Auto Rotation:", GUILayout.Width(100));
+            if (GUILayout.Button(cameraRotEnabled ? "ON" : "OFF", GUILayout.Width(40)))
             {
                 cameraRotEnabled = !cameraRotEnabled;
                 SaveToScenario();
@@ -1031,15 +1262,6 @@ public class FastVesselChanger : MonoBehaviour
             if (GUILayout.Button(cameraRotRandomEnabled ? "ON" : "OFF", GUILayout.Width(40)))
             {
                 cameraRotRandomEnabled = !cameraRotRandomEnabled;
-                SaveToScenario();
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Zoom tracking:", GUILayout.Width(150));
-            if (GUILayout.Button(zoomTrackingEnabled ? "ON" : "OFF", GUILayout.Width(40)))
-            {
-                zoomTrackingEnabled = !zoomTrackingEnabled;
                 SaveToScenario();
             }
             GUILayout.EndHorizontal();
@@ -1097,6 +1319,27 @@ public class FastVesselChanger : MonoBehaviour
                 cameraRotYRate = (float)Math.Round(cameraRotYRate + 1f, 1);
                 cameraRotYText = cameraRotYRate.ToString("F1");
                 SaveToScenario();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(6);
+
+            // ---- Overlay Log Settings ----
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Players log:", GUILayout.Width(100));
+            if (GUILayout.Button(_writeLMPPlayersLog ? "ON" : "OFF", GUILayout.Width(40)))
+            {
+                _writeLMPPlayersLog = !_writeLMPPlayersLog;
+                SaveUserPrefs();
+            }
+            GUILayout.EndHorizontal();
+
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Vessel log:", GUILayout.Width(100));
+            if (GUILayout.Button(_writeVesselLog ? "ON" : "OFF", GUILayout.Width(40)))
+            {
+                _writeVesselLog = !_writeVesselLog;
+                SaveUserPrefs();
             }
             GUILayout.EndHorizontal();
 
@@ -1191,7 +1434,7 @@ public class FastVesselChanger : MonoBehaviour
         SaveToScenario();
     }
 
-    void BuildCycleList()
+    void BuildCycleList(bool resetShuffleBag = true)
     {
         cycleList.Clear();
         foreach (var v in FlightGlobals.Vessels)
@@ -1201,9 +1444,53 @@ public class FastVesselChanger : MonoBehaviour
             if (selected.TryGetValue(v.id, out included) && included)
                 cycleList.Add(v);
         }
-        // Reset the shuffle bag so the next switch starts a fresh random round
+
+        if (resetShuffleBag)
+        {
+            // Reset the shuffle bag so the next switch starts a fresh random round.
+            shuffleRemaining.Clear();
+            shuffleRemaining.AddRange(cycleList);
+            VerboseLog("[FastVesselChanger] Shuffle bag reset: " + shuffleRemaining.Count + " vessels in round");
+        }
+    }
+
+    void RestoreShuffleBagFromScenario(FastVesselChangerScenario? scen)
+    {
         shuffleRemaining.Clear();
-        shuffleRemaining.AddRange(cycleList);
+
+        if (cycleList.Count == 0)
+        {
+            VerboseLog("[FastVesselChanger] Shuffle bag restore skipped: cycle list is empty", warning: true);
+            return;
+        }
+
+        if (scen == null || scen.shuffleRemainingVesselIds.Count == 0)
+        {
+            shuffleRemaining.AddRange(cycleList);
+            VerboseLog("[FastVesselChanger] Shuffle bag restore: no persisted remainder, starting fresh round (" + shuffleRemaining.Count + " vessels)");
+            return;
+        }
+
+        var cycleById = cycleList.ToDictionary(v => v.id, v => v);
+        foreach (var id in scen.shuffleRemainingVesselIds)
+        {
+            Guid vesselId;
+            if (!Guid.TryParse(id, out vesselId))
+                continue;
+
+            Vessel vessel;
+            if (cycleById.TryGetValue(vesselId, out vessel) && !shuffleRemaining.Any(existing => existing.id == vesselId))
+                shuffleRemaining.Add(vessel);
+        }
+
+        if (shuffleRemaining.Count == 0)
+        {
+            VerboseLog("[FastVesselChanger] Shuffle bag restore: persisted remainder was empty or stale, next switch will refill from cycle list");
+        }
+        else
+        {
+            VerboseLog("[FastVesselChanger] Shuffle bag restored: remaining=" + shuffleRemaining.Count + " of " + cycleList.Count);
+        }
     }
 
     void SwitchToNext()
@@ -1280,22 +1567,28 @@ public class FastVesselChanger : MonoBehaviour
     {
         if (v == null) return;
 
-        SaveToScenario();
         SaveUserPrefs();
 
         bool windowWasVisible = showWindow;
 
         // Save zoom level for the current vessel before switching away
-        if (zoomTrackingEnabled)
+        var currentVessel = FlightGlobals.ActiveVessel;
+        if (currentVessel != null)
         {
-            var currentVessel = FlightGlobals.ActiveVessel;
-            if (currentVessel != null)
+            var cam = FlightCamera.fetch;
+            if (cam != null)
             {
-                var cam = FlightCamera.fetch;
-                if (cam != null)
-                    _vesselZooms[currentVessel.id] = cam.Distance;
+                _vesselZooms[currentVessel.id] = cam.Distance;
+                VerboseLog("[FastVesselChanger] Captured zoom before switch: vessel=" + currentVessel.vesselName + " id=" + currentVessel.id + " zoom=" + cam.Distance);
+            }
+            else
+            {
+                VerboseLog("[FastVesselChanger] Could not capture zoom before switch: FlightCamera.fetch is null", warning: true);
             }
         }
+
+        // Persist the latest zoom map before triggering FLIGHT->FLIGHT reload.
+        SaveToScenario();
 
         // Start holding the UI hidden before the switch so no stage of the
         // vessel transition can sneak the HUD back in.
@@ -1343,15 +1636,24 @@ public class FastVesselChanger : MonoBehaviour
         showWindow = windowWasVisible;
 
         // Queue zoom restore — Update() will apply it every frame until it sticks or times out
-        if (zoomTrackingEnabled)
+        float savedZoom;
+        if (_vesselZooms.TryGetValue(v.id, out savedZoom))
         {
-            float savedZoom;
-            if (_vesselZooms.TryGetValue(v.id, out savedZoom))
-            {
-                _pendingZoomVesselId = v.id;
-                _pendingZoom = savedZoom;
-                _zoomRestoreFrames = 240; // ~4s at 60fps — covers full vessel load pipeline
-            }
+            _zoomLockoutVesselId = Guid.Empty;
+            _zoomLockoutTarget = 0f;
+            _zoomLockoutUntilRealtime = 0f;
+            _pendingZoomVesselId = v.id;
+            _pendingZoom = savedZoom;
+            _zoomRestoreFrames = 240; // ~4s at 60fps — covers full vessel load pipeline
+            _pendingZoomDeadlineRealtime = Time.realtimeSinceStartup + 20f;
+            VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + savedZoom);
+        }
+        else
+        {
+            _zoomLockoutVesselId = Guid.Empty;
+            _zoomLockoutTarget = 0f;
+            _zoomLockoutUntilRealtime = 0f;
+            VerboseLog("[FastVesselChanger] RestoreZoom skipped: no saved zoom for vessel=" + v.vesselName + " id=" + v.id);
         }
 
         // Randomize camera rotation rates if enabled
@@ -1359,6 +1661,12 @@ public class FastVesselChanger : MonoBehaviour
         {
             cameraRotXRate = UnityEngine.Random.Range(-1.5f, 1.5f);
             cameraRotYRate = UnityEngine.Random.Range(-1.5f, 1.5f);
+            if (v.situation == Vessel.Situations.LANDED
+                || v.situation == Vessel.Situations.PRELAUNCH
+                || v.situation == Vessel.Situations.SPLASHED)
+            {
+                cameraRotXRate = 0f;
+            }
             cameraRotXText = cameraRotXRate.ToString("F2");
             cameraRotYText = cameraRotYRate.ToString("F2");
             // Store in statics so they survive addon destruction AND scenario reloads.
@@ -1380,6 +1688,7 @@ public class FastVesselChanger : MonoBehaviour
             string prefsPath = GetUserPrefsPath();
             if (!File.Exists(prefsPath))
             {
+                SaveUserPrefs();
                 return;
             }
 
@@ -1393,6 +1702,8 @@ public class FastVesselChanger : MonoBehaviour
             lastShowCameraControls = showCameraControls;
             showTypeFilter = ParseBool(root["ShowTypeFilter"]?.InnerText, false);
             lastShowTypeFilter = showTypeFilter;
+            _writeLMPPlayersLog = ParseBool(root["WriteLMPPlayersLog"]?.InnerText, false);
+            _writeVesselLog = ParseBool(root["WriteVesselLog"]?.InnerText, false);
 
             XmlElement filters = root["TypeFilters"];
             if (filters != null)
@@ -1458,6 +1769,14 @@ public class FastVesselChanger : MonoBehaviour
             windowNode.SetAttribute("height", windowRect.height.ToString(CultureInfo.InvariantCulture));
             root.AppendChild(windowNode);
 
+            XmlElement writeLMPPlayersLogNode = doc.CreateElement("WriteLMPPlayersLog");
+            writeLMPPlayersLogNode.InnerText = _writeLMPPlayersLog.ToString();
+            root.AppendChild(writeLMPPlayersLogNode);
+
+            XmlElement writeVesselLogNode = doc.CreateElement("WriteVesselLog");
+            writeVesselLogNode.InnerText = _writeVesselLog.ToString();
+            root.AppendChild(writeVesselLogNode);
+
             doc.Save(prefsPath);
         }
         catch (Exception e)
@@ -1500,6 +1819,16 @@ public class FastVesselChanger : MonoBehaviour
     {
         try
         {
+            // Snapshot current vessel's zoom before serializing so it isn't lost
+            // when saving without having switched away from it first.
+            var activeVessel = FlightGlobals.ActiveVessel;
+            if (activeVessel != null)
+            {
+                var cam = FlightCamera.fetch;
+                if (cam != null)
+                    _vesselZooms[activeVessel.id] = cam.Distance;
+            }
+
             var scen = FastVesselChangerScenario.Instance;
             if (scen != null)
             {
@@ -1511,9 +1840,10 @@ public class FastVesselChanger : MonoBehaviour
                 scen.cameraRotRandomEnabled = cameraRotRandomEnabled;
                 scen.cameraRotXRate = cameraRotXRate;
                 scen.cameraRotYRate = cameraRotYRate;
-                scen.zoomTrackingEnabled = zoomTrackingEnabled;
                 scen.selectedVesselIds.Clear();
                 scen.selectedVesselTypes.Clear();
+                scen.shuffleRemainingVesselIds.Clear();
+                scen.vesselZoomEntries.Clear();
                 
                 foreach (var kv in selected)
                 {
@@ -1523,6 +1853,18 @@ public class FastVesselChanger : MonoBehaviour
                 foreach (var kvType in vesselTypeFilter)
                 {
                     if (kvType.Value) scen.selectedVesselTypes.Add(kvType.Key);
+                }
+
+                foreach (var remaining in shuffleRemaining)
+                {
+                    if (remaining != null)
+                        scen.shuffleRemainingVesselIds.Add(remaining.id.ToString());
+                }
+
+                foreach (var kvZoom in _vesselZooms)
+                {
+                    if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
+                    scen.vesselZoomEntries.Add(kvZoom.Key + "|" + kvZoom.Value.ToString(CultureInfo.InvariantCulture));
                 }
                 
                 try
@@ -1803,18 +2145,35 @@ public class FastVesselChanger : MonoBehaviour
                     Directory.CreateDirectory(dir);
 
                 // --- players_online.txt ---
-                var players = GetLMPPlayerNames();
-                File.WriteAllText(
-                    Path.Combine(dir, TWITCH_PLAYERS_FILE),
-                    players.Count > 0 ? string.Join(Environment.NewLine, players) : string.Empty);
+                List<string> players = null;
+                if (_writeLMPPlayersLog)
+                {
+                    players = GetLMPPlayerNames();
+                    string playersPath = Path.Combine(dir, TWITCH_PLAYERS_FILE);
+                    File.WriteAllText(
+                        playersPath,
+                        players.Count > 0 ? string.Join(Environment.NewLine, players) : string.Empty);
+                }
 
                 // --- current_vessel.txt ---
-                var v = FlightGlobals.ActiveVessel;
-                string vesselLine  = v != null ? v.vesselName : "";
-                string statusLine  = v != null ? GetVesselSituationText(v) : "";
-                File.WriteAllText(
-                    Path.Combine(dir, TWITCH_VESSEL_FILE),
-                    vesselLine + Environment.NewLine + statusLine);
+                if (_writeVesselLog)
+                {
+                    var v = FlightGlobals.ActiveVessel;
+                    string vesselLine  = v != null ? v.vesselName : "";
+                    string statusLine  = v != null ? GetVesselSituationText(v) : "";
+                    string vesselPath = Path.Combine(dir, TWITCH_VESSEL_FILE);
+                    File.WriteAllText(
+                        vesselPath,
+                        vesselLine + Environment.NewLine + statusLine);
+                }
+
+                if (!_twitchWriterStartupLogged)
+                {
+                    _twitchWriterStartupLogged = true;
+                    VerboseLog("[FastVesselChanger] Twitch overlay writer active. LunaEnabled=" + FVCLunaHelper.IsLunaEnabled
+                        + ", playersLog=" + _writeLMPPlayersLog
+                        + ", vesselLog=" + _writeVesselLog);
+                }
             }
             catch (Exception e)
             {
@@ -1832,41 +2191,76 @@ public class FastVesselChanger : MonoBehaviour
     /// </summary>
     List<string> GetLMPPlayerNames()
     {
-        var players = new List<string>();
+        var players = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (!FVCLunaHelper.IsLunaEnabled)
-            return players;
+            return new List<string>();
 
         try
         {
+            bool statusTypeAttempted = false;
             foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
             {
                 Type statusType = a.GetType("LunaMultiplayer.Client.Systems.Status.StatusSystem")
                                ?? a.GetType("LMP.Client.Systems.Status.StatusSystem");
-                if (statusType == null) continue;
 
-                // Singleton may be called Singleton or Instance depending on LMP version
-                PropertyInfo singletonProp =
-                    statusType.GetProperty("Singleton", BindingFlags.Public | BindingFlags.Static)
-                 ?? statusType.GetProperty("Instance",  BindingFlags.Public | BindingFlags.Static);
-                if (singletonProp == null) break;
-
-                var singleton = singletonProp.GetValue(null);
-                if (singleton == null) break;
-
-                var listProp = singleton.GetType().GetProperty(
-                    "PlayerStatusList", BindingFlags.Public | BindingFlags.Instance);
-                if (listProp == null) break;
-
-                var dict = listProp.GetValue(singleton) as IDictionary;
-                if (dict == null) break;
-
-                foreach (var key in dict.Keys)
+                if (statusType == null)
                 {
-                    string name = key.ToString();
-                    if (!string.Equals(name, "Streamer", StringComparison.OrdinalIgnoreCase))
-                        players.Add(name);
+                    statusType = SafeGetTypes(a)
+                        .FirstOrDefault(t => t != null
+                                          && string.Equals(t.Name, "StatusSystem", StringComparison.Ordinal)
+                                          && ((t.Namespace ?? string.Empty).IndexOf("Status", StringComparison.OrdinalIgnoreCase) >= 0
+                                           || (t.FullName ?? string.Empty).IndexOf("LMP", StringComparison.OrdinalIgnoreCase) >= 0
+                                           || (t.FullName ?? string.Empty).IndexOf("LunaMultiplayer", StringComparison.OrdinalIgnoreCase) >= 0));
                 }
+
+                if (statusType == null) continue;
+                statusTypeAttempted = true;
+
+                object statusInstance = TryGetStatusSystemInstance(statusType);
+                int beforeCount = players.Count;
+
+                // Read from instance if available; otherwise probe static members on the status type.
+                if (statusInstance != null)
+                    CollectPlayersFromStatusCarrier(statusInstance, players);
+                else
+                    CollectPlayersFromStatusCarrier(null, players, statusType);
+
+                if (VERBOSE_DIAGNOSTICS)
+                {
+                    if (statusInstance == null)
+                    {
+                        string knownProps = string.Join(", ", statusType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance).Select(p => p.Name).ToArray());
+                        string knownFields = string.Join(", ", statusType.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance).Select(f => f.Name).ToArray());
+                        VerboseLog("[FastVesselChanger] LMP StatusSystem instance not found; probing static members. Props: " + knownProps + " | Fields: " + knownFields);
+                    }
+                    else
+                    {
+                        VerboseLog("[FastVesselChanger] LMP StatusSystem carrier type: " + statusInstance.GetType().FullName + ", extractedPlayers=" + (players.Count - beforeCount));
+                    }
+                }
+
                 break;
+            }
+
+            if (!statusTypeAttempted && VERBOSE_DIAGNOSTICS)
+            {
+                var candidateTypes = AppDomain.CurrentDomain.GetAssemblies()
+                    .Where(a =>
+                    {
+                        string n = a.GetName().Name ?? string.Empty;
+                        return n.IndexOf("Luna", StringComparison.OrdinalIgnoreCase) >= 0
+                            || n.IndexOf("LMP", StringComparison.OrdinalIgnoreCase) >= 0;
+                    })
+                    .SelectMany(a => SafeGetTypes(a))
+                    .Where(t => t != null && (t.Name.IndexOf("Status", StringComparison.OrdinalIgnoreCase) >= 0
+                                           || t.FullName.IndexOf("Player", StringComparison.OrdinalIgnoreCase) >= 0))
+                    .Select(t => t.FullName)
+                    .Where(name => !string.IsNullOrEmpty(name))
+                    .Take(30)
+                    .ToArray();
+
+                VerboseLog("[FastVesselChanger] LMP status type not found via reflection. Candidate types: "
+                    + (candidateTypes.Length > 0 ? string.Join(" | ", candidateTypes) : "<none>"));
             }
         }
         catch (Exception e)
@@ -1874,7 +2268,339 @@ public class FastVesselChanger : MonoBehaviour
             Debug.LogWarning("[FastVesselChanger] GetLMPPlayerNames error: " + e.Message);
         }
 
-        return players;
+        return players.OrderBy(name => name).ToList();
+    }
+
+    object? TryGetStatusSystemInstance(Type statusType)
+    {
+        if (statusType == null)
+            return null;
+
+        const BindingFlags staticFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy;
+        string[] singletonNames = new[] { "Singleton", "Instance", "fetch", "Fetch", "_instance", "instance" };
+
+        for (Type? current = statusType; current != null; current = current.BaseType)
+        {
+            foreach (string memberName in singletonNames)
+            {
+                var prop = current.GetProperty(memberName, staticFlags);
+                if (prop != null && prop.GetIndexParameters().Length == 0)
+                {
+                    try
+                    {
+                        var value = prop.GetValue(null, null);
+                        if (value != null && statusType.IsAssignableFrom(value.GetType()))
+                            return value;
+                    }
+                    catch { }
+                }
+
+                var field = current.GetField(memberName, staticFlags);
+                if (field != null)
+                {
+                    try
+                    {
+                        var value = field.GetValue(null);
+                        if (value != null && statusType.IsAssignableFrom(value.GetType()))
+                            return value;
+                    }
+                    catch { }
+                }
+            }
+        }
+
+        try
+        {
+            if (typeof(UnityEngine.Object).IsAssignableFrom(statusType))
+            {
+                var objs = Resources.FindObjectsOfTypeAll(statusType);
+                if (objs != null && objs.Length > 0)
+                    return objs[0];
+            }
+        }
+        catch { }
+
+        // Fallback: find any static holder in the same assembly that exposes this system.
+        try
+        {
+            foreach (var holderType in SafeGetTypes(statusType.Assembly))
+            {
+                if (holderType == null)
+                    continue;
+
+                const BindingFlags holderFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+
+                foreach (var prop in holderType.GetProperties(holderFlags))
+                {
+                    if (prop.GetIndexParameters().Length != 0)
+                        continue;
+
+                    object? value = null;
+                    try { value = prop.GetValue(null, null); } catch { }
+                    if (value == null)
+                        continue;
+
+                    if (statusType.IsAssignableFrom(value.GetType()))
+                        return value;
+
+                    if (value is IEnumerable enumerable)
+                    {
+                        foreach (var item in enumerable)
+                        {
+                            if (item != null && statusType.IsAssignableFrom(item.GetType()))
+                                return item;
+                        }
+                    }
+                }
+
+                foreach (var field in holderType.GetFields(holderFlags))
+                {
+                    object? value = null;
+                    try { value = field.GetValue(null); } catch { }
+                    if (value == null)
+                        continue;
+
+                    if (statusType.IsAssignableFrom(value.GetType()))
+                        return value;
+
+                    if (value is IEnumerable enumerable)
+                    {
+                        foreach (var item in enumerable)
+                        {
+                            if (item != null && statusType.IsAssignableFrom(item.GetType()))
+                                return item;
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    void CollectPlayersFromStatusCarrier(object? carrier, HashSet<string> players, Type? explicitType = null)
+    {
+        Type carrierType = explicitType ?? carrier?.GetType();
+        if (carrierType == null)
+            return;
+
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+        foreach (var prop in carrierType.GetProperties(flags))
+        {
+            if (!IsLikelyPlayerContainerMemberName(prop.Name) || prop.GetIndexParameters().Length != 0)
+                continue;
+
+            var getter = prop.GetGetMethod(true);
+            if (getter != null)
+            {
+                object? target = getter.IsStatic ? null : carrier;
+                if (getter.IsStatic || target != null)
+                {
+                    object? container = null;
+                    try { container = prop.GetValue(target, null); } catch { }
+                    CollectPlayersFromContainer(container, players);
+                }
+            }
+        }
+
+        foreach (var field in carrierType.GetFields(flags))
+        {
+            if (!IsLikelyPlayerContainerMemberName(field.Name))
+                continue;
+
+            object? target = field.IsStatic ? null : carrier;
+            if (field.IsStatic || target != null)
+            {
+                object? container = null;
+                try { container = field.GetValue(target); } catch { }
+                CollectPlayersFromContainer(container, players);
+            }
+        }
+    }
+
+    bool IsLikelyPlayerContainerMemberName(string memberName)
+    {
+        if (string.IsNullOrEmpty(memberName))
+            return false;
+
+        string normalized = memberName.Replace("<", string.Empty).Replace(">", string.Empty).Replace("k__BackingField", string.Empty);
+        normalized = normalized.ToLowerInvariant();
+
+        bool hasPlayer = normalized.Contains("player");
+        bool hasContainer = normalized.Contains("list") || normalized.Contains("status") || normalized.Contains("collection") || normalized.Contains("dict") || normalized.Contains("map");
+        return hasPlayer && hasContainer;
+    }
+
+    void CollectPlayersFromContainer(object? container, HashSet<string> players)
+    {
+        if (container == null || players == null)
+            return;
+
+        if (container is IDictionary dict)
+        {
+            if (VERBOSE_DIAGNOSTICS)
+            {
+                object firstKey = null;
+                object firstValue = null;
+                foreach (DictionaryEntry entry in dict)
+                {
+                    firstKey = entry.Key;
+                    firstValue = entry.Value;
+                    break;
+                }
+                string keyType = firstKey != null ? firstKey.GetType().FullName : "<none>";
+                string valueType = firstValue != null ? firstValue.GetType().FullName : "<none>";
+                VerboseLog("[FastVesselChanger] LMP player container IDictionary shape: count=" + dict.Count + ", keyType=" + keyType + ", valueType=" + valueType);
+            }
+
+            foreach (DictionaryEntry entry in dict)
+            {
+                AddPlayerName(entry.Key, players);
+                AddPlayerName(entry.Value, players);
+            }
+            return;
+        }
+
+        if (container is IEnumerable enumerable)
+        {
+            int index = 0;
+            foreach (var item in enumerable)
+            {
+                if (item == null)
+                    continue;
+
+                AddPlayerName(item, players);
+
+                var itemType = item.GetType();
+                var keyProp = itemType.GetProperty("Key", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var valueProp = itemType.GetProperty("Value", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (keyProp != null)
+                {
+                    object keyObj = null;
+                    try { keyObj = keyProp.GetValue(item, null); } catch { }
+                    AddPlayerName(keyObj, players);
+                }
+                if (valueProp != null)
+                {
+                    object valueObj = null;
+                    try { valueObj = valueProp.GetValue(item, null); } catch { }
+                    AddPlayerName(valueObj, players);
+                }
+
+                index++;
+                if (index > 256)
+                    break;
+            }
+        }
+    }
+
+    void AddPlayerName(object? source, HashSet<string> players)
+    {
+        string name = ExtractLikelyPlayerName(source);
+        if (string.IsNullOrWhiteSpace(name))
+            return;
+
+        if (string.Equals(name, "Streamer", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        players.Add(name);
+    }
+
+    string ExtractLikelyPlayerName(object? source)
+    {
+        if (source == null)
+            return string.Empty;
+
+        string text = source as string;
+        if (!string.IsNullOrEmpty(text))
+            return text!.Trim();
+
+        Type type = source.GetType();
+
+        string[] candidateNames = new string[]
+        {
+            "PlayerName", "Name", "NickName", "Nickname", "DisplayName", "Username", "UserName"
+        };
+
+        foreach (string memberName in candidateNames)
+        {
+            var prop = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (prop != null && prop.PropertyType == typeof(string))
+            {
+                string value = prop.GetValue(source, null) as string;
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value!.Trim();
+            }
+        }
+
+        foreach (string memberName in candidateNames)
+        {
+            var field = type.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null && field.FieldType == typeof(string))
+            {
+                string value = field.GetValue(source) as string;
+                if (!string.IsNullOrWhiteSpace(value))
+                    return value!.Trim();
+            }
+        }
+
+        var nestedCandidates = type.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            .Where(p => p.PropertyType != typeof(string) && p.GetIndexParameters().Length == 0)
+            .Take(6);
+
+        foreach (var nested in nestedCandidates)
+        {
+            object nestedObj = null;
+            try { nestedObj = nested.GetValue(source, null); } catch { }
+            if (nestedObj == null)
+                continue;
+
+            foreach (string memberName in candidateNames)
+            {
+                var nestedProp = nestedObj.GetType().GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (nestedProp != null && nestedProp.PropertyType == typeof(string))
+                {
+                    string value = nestedProp.GetValue(nestedObj, null) as string;
+                    if (!string.IsNullOrWhiteSpace(value))
+                        return value!.Trim();
+                }
+            }
+        }
+
+        string fallback = source.ToString();
+        if (string.IsNullOrWhiteSpace(fallback))
+            return string.Empty;
+
+        fallback = fallback.Trim();
+        if (fallback.Length >= 28 && fallback.Count(ch => ch == '-') >= 3)
+            return string.Empty;
+
+        bool numericOnly = fallback.All(ch => char.IsDigit(ch));
+        if (numericOnly)
+            return string.Empty;
+
+        return fallback;
+    }
+
+    IEnumerable<Type> SafeGetTypes(Assembly assembly)
+    {
+        if (assembly == null)
+            return Enumerable.Empty<Type>();
+
+        try
+        {
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            return ex.Types.Where(t => t != null);
+        }
+        catch
+        {
+            return Enumerable.Empty<Type>();
+        }
     }
 
     /// <summary>
@@ -1938,130 +2664,5 @@ public class FastVesselChanger : MonoBehaviour
         _appButton = null;
         if (forceClearShared || removed)
             _sharedAppButton = null;
-    }
-}
-
-// Minimal addon that registers the stock AppLauncher button in Space Center and Tracking Station.
-// The main FastVesselChanger addon (Flight) handles Flight and Map View.
-[KSPAddon(KSPAddon.Startup.SpaceCentre | KSPAddon.Startup.TrackingStation, false)]
-public class FastVesselChangerNonFlight : MonoBehaviour
-{
-    private object _appButton = null;
-
-    void Start()
-    {
-        GameEvents.onGUIApplicationLauncherReady.Add(OnAppLauncherReady);
-        GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnAppLauncherUnreadifying);
-        StartCoroutine(RetryButton());
-    }
-
-    void OnAppLauncherReady() { AddButton(); }
-
-    void OnAppLauncherUnreadifying(GameScenes _) { RemoveButton("onGUIApplicationLauncherUnreadifying"); }
-
-    System.Collections.IEnumerator RetryButton()
-    {
-        for (int i = 0; i < 15 && _appButton == null; i++)
-        {
-            AddButton();
-            if (_appButton != null) yield break;
-            yield return new UnityEngine.WaitForSeconds(1f);
-        }
-    }
-
-    void AddButton()
-    {
-        if (_appButton != null) return;
-        try
-        {
-            Type alType = null;
-            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                alType = a.GetType("ApplicationLauncher") ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
-                if (alType != null) break;
-            }
-            if (alType == null) return;
-
-            var readyProp = alType.GetProperty("Ready", BindingFlags.Public | BindingFlags.Static);
-            if (readyProp == null || !(bool)readyProp.GetValue(null, null)) return;
-
-            var instanceProp = alType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-            var instance = instanceProp?.GetValue(null, null);
-            if (instance == null) return;
-
-            Type appScenesType = alType.GetNestedType("AppScenes", BindingFlags.Public);
-            object scenes;
-            if (appScenesType != null)
-            {
-                int flags = 0;
-                foreach (var n in new[] { "SPACECENTER", "TRACKINGSTATION" })
-                    try { flags |= (int)Enum.Parse(appScenesType, n); } catch { }
-                if (flags == 0) flags = 1; // SPACECENTER numeric fallback
-                scenes = Enum.ToObject(appScenesType, flags);
-            }
-            else
-            {
-                scenes = 1 | 32; // SPACECENTER | TRACKINGSTATION numeric fallback
-            }
-
-            Type ruitType = alType.Assembly.GetType("RUIToggleButton");
-            Type onTrueType = ruitType?.GetNestedType("OnTrue");
-            Type onFalseType = ruitType?.GetNestedType("OnFalse");
-            Delegate onTrue = onTrueType != null
-                ? Delegate.CreateDelegate(onTrueType, this, "OnTrue")
-                : (Delegate)(UnityEngine.Events.UnityAction)OnTrue;
-            Delegate onFalse = onFalseType != null
-                ? Delegate.CreateDelegate(onFalseType, this, "OnFalse")
-                : (Delegate)(UnityEngine.Events.UnityAction)OnFalse;
-
-            Texture2D icon = GameDatabase.Instance.GetTexture("FastVesselChanger/Textures/icon", false);
-            if (icon == null) icon = new Texture2D(1, 1);
-
-            var addMethod = alType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                .FirstOrDefault(m => m.Name == "AddModApplication" && m.GetParameters().Length == 8);
-            if (addMethod != null)
-                _appButton = addMethod.Invoke(instance, new object[] { onTrue, onFalse, null, null, null, null, scenes, icon });
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning("[FastVesselChanger] NonFlight button failed: " + e.Message);
-        }
-    }
-
-    void OnTrue() { }
-    void OnFalse() { }
-
-    void OnDestroy()
-    {
-        GameEvents.onGUIApplicationLauncherReady.Remove(OnAppLauncherReady);
-        GameEvents.onGUIApplicationLauncherUnreadifying.Remove(OnAppLauncherUnreadifying);
-        RemoveButton("OnDestroy");
-    }
-
-    void RemoveButton(string source)
-    {
-        if (_appButton == null) return;
-        try
-        {
-            Type alType = null;
-            foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                alType = a.GetType("ApplicationLauncher") ?? a.GetType("KSP.UI.Screens.ApplicationLauncher");
-                if (alType != null) break;
-            }
-            if (alType != null)
-            {
-                var instanceProp = alType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                var instance = instanceProp?.GetValue(null, null);
-                var rem = alType.GetMethod("RemoveModApplication", BindingFlags.Public | BindingFlags.Instance);
-                if (rem != null && instance != null)
-                    rem.Invoke(instance, new object[] { _appButton });
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning("[FastVesselChanger] NonFlight button remove failed (" + source + "): " + e.Message);
-        }
-        _appButton = null;
     }
 }

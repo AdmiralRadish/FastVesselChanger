@@ -10,12 +10,13 @@ obj/
 .idea/
 .vs/
 *.zip
-
+GameData/*.png
 *.dll
 LUNAMULTIPLAYER.md
 *_*.md
 *.htm
 NuGet.config
+*ns.md
 
 # Build outputs
 
