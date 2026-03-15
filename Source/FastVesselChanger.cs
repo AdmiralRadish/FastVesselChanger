@@ -1659,14 +1659,15 @@ public class FastVesselChanger : MonoBehaviour
         // Randomize camera rotation rates if enabled
         if (cameraRotRandomEnabled)
         {
-            cameraRotXRate = UnityEngine.Random.Range(-1.5f, 1.5f);
-            cameraRotYRate = UnityEngine.Random.Range(-1.5f, 1.5f);
-            if (v.situation == Vessel.Situations.LANDED
+            // Generate a rate in [-4, -1] ∪ [1, 4] to ensure noticeable but bounded rotation.
+            float RandRate() => UnityEngine.Random.Range(1f, 4f) * (UnityEngine.Random.value < 0.5f ? -1f : 1f);
+
+            bool isGrounded = v.situation == Vessel.Situations.LANDED
                 || v.situation == Vessel.Situations.PRELAUNCH
-                || v.situation == Vessel.Situations.SPLASHED)
-            {
-                cameraRotXRate = 0f;
-            }
+                || v.situation == Vessel.Situations.SPLASHED;
+
+            cameraRotYRate = RandRate();
+            cameraRotXRate = isGrounded ? 0f : RandRate();
             cameraRotXText = cameraRotXRate.ToString("F2");
             cameraRotYText = cameraRotYRate.ToString("F2");
             // Store in statics so they survive addon destruction AND scenario reloads.
