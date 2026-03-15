@@ -5,6 +5,8 @@
 *.userprefs
 *.userosscache
 *.user
+
+# Build outputs
 bin/
 obj/
 .idea/
@@ -17,9 +19,6 @@ LUNAMULTIPLAYER.md
 *.htm
 NuGet.config
 *ns.md
-
-# Build outputs
-
 
 # GameData Plugins (built output — not source-controlled)
 GameData/*/Plugins/*.dll
