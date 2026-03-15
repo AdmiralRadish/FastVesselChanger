@@ -516,7 +516,10 @@ public class FastVesselChanger : MonoBehaviour
     private static FieldInfo _camDistField = null; // cached reflection handle
     private const float ZOOM_LOCKOUT_SECONDS = 2.0f;
 
-    // Cached reflection handles for UIMasterController (the class that actually hides/shows KSP's HUD)
+    // Cached reflection handles for UIMasterController (the class that actually hides/shows KSP's HUD).
+    // _uiMasterInstance is resolved lazily on first use because UIMasterController.Instance is not
+    // assigned yet when Start() runs — KSP initialises it after addon startup.
+    private PropertyInfo _uiInstanceProp = null;
     private object _uiMasterInstance = null;
     private MethodInfo _uiHideMethod = null;
     private MethodInfo _uiShowMethod = null;
@@ -709,24 +712,34 @@ public class FastVesselChanger : MonoBehaviour
                 var t = a.GetType("UIMasterController");
                 if (t == null) continue;
 
-                var instanceProp = t.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                if (instanceProp != null)
-                    _uiMasterInstance = instanceProp.GetValue(null);
-
+                _uiInstanceProp = t.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
                 _uiHideMethod = t.GetMethod("HideUI", BindingFlags.Public | BindingFlags.Instance);
                 _uiShowMethod = t.GetMethod("ShowUI", BindingFlags.Public | BindingFlags.Instance);
 
-                Debug.Log("[FastVesselChanger] UIMasterController found: HideUI=" + (_uiHideMethod != null) + ", ShowUI=" + (_uiShowMethod != null));
+                Debug.Log("[FastVesselChanger] UIMasterController type found: HideUI=" + (_uiHideMethod != null) + ", ShowUI=" + (_uiShowMethod != null));
                 break;
             }
-            if (_uiMasterInstance == null)
-                Debug.LogWarning("[FastVesselChanger] UIMasterController.Instance not found — falling back to event firing");
+            if (_uiInstanceProp == null)
+                Debug.LogWarning("[FastVesselChanger] UIMasterController type not found — falling back to event firing");
         }
         catch (Exception e)
         {
             Debug.LogWarning("[FastVesselChanger] CacheUIMasterController failed: " + e.Message);
         }
     }
+
+    // Resolves UIMasterController.Instance on first successful call and caches it.
+    // Called lazily rather than at Start() because KSP assigns the instance after addon startup.
+#pragma warning disable CS8603
+    object GetUIMasterInstance()
+    {
+        if (_uiMasterInstance != null) return _uiMasterInstance;
+        if (_uiInstanceProp == null) return null;
+        try { _uiMasterInstance = _uiInstanceProp.GetValue(null); }
+        catch { }
+        return _uiMasterInstance;
+    }
+#pragma warning restore CS8603
 
     // Calls UIMasterController.HideUI() — this is what KSP's F2 handler uses internally.
     // We ALSO always fire onHideUI directly because vessel transitions can call
@@ -736,9 +749,10 @@ public class FastVesselChanger : MonoBehaviour
     // to reach the individual UI elements regardless.
     void InvokeHideUI()
     {
-        if (_uiMasterInstance != null && _uiHideMethod != null)
+        var inst = GetUIMasterInstance();
+        if (inst != null && _uiHideMethod != null)
         {
-            try { _uiHideMethod.Invoke(_uiMasterInstance, null); }
+            try { _uiHideMethod.Invoke(inst, null); }
             catch (Exception e) { Debug.LogWarning("[FastVesselChanger] UIMasterController.HideUI() failed: " + e.Message); }
         }
         GameEvents.onHideUI.Fire();
@@ -747,11 +761,12 @@ public class FastVesselChanger : MonoBehaviour
     // Calls UIMasterController.ShowUI() — same reasoning as InvokeHideUI.
     void InvokeShowUI()
     {
-        if (_uiMasterInstance != null && _uiShowMethod != null)
+        var inst = GetUIMasterInstance();
+        if (inst != null && _uiShowMethod != null)
         {
             try
             {
-                _uiShowMethod.Invoke(_uiMasterInstance, null);
+                _uiShowMethod.Invoke(inst, null);
                 return;
             }
             catch (Exception e)
@@ -1659,15 +1674,22 @@ public class FastVesselChanger : MonoBehaviour
         // Randomize camera rotation rates if enabled
         if (cameraRotRandomEnabled)
         {
-            // Generate a rate in [-4, -1] ∪ [1, 4] to ensure noticeable but bounded rotation.
-            float RandRate() => UnityEngine.Random.Range(1f, 4f) * (UnityEngine.Random.value < 0.5f ? -1f : 1f);
-
             bool isGrounded = v.situation == Vessel.Situations.LANDED
                 || v.situation == Vessel.Situations.PRELAUNCH
                 || v.situation == Vessel.Situations.SPLASHED;
 
-            cameraRotYRate = RandRate();
-            cameraRotXRate = isGrounded ? 0f : RandRate();
+            // Each axis is uniform [-4, 4]. Resample until the sum of magnitudes is >= 1.10,
+            // guaranteeing a noticeable combined rotation. When grounded, pitch (X) is forced
+            // to 0 so the constraint effectively becomes |Y| >= 1.10.
+            float x, y;
+            do
+            {
+                x = isGrounded ? 0f : UnityEngine.Random.Range(-4f, 4f);
+                y = UnityEngine.Random.Range(-4f, 4f);
+            } while (Mathf.Abs(x) + Mathf.Abs(y) < 1.10f);
+
+            cameraRotXRate = x;
+            cameraRotYRate = y;
             cameraRotXText = cameraRotXRate.ToString("F2");
             cameraRotYText = cameraRotYRate.ToString("F2");
             // Store in statics so they survive addon destruction AND scenario reloads.
@@ -1867,13 +1889,6 @@ public class FastVesselChanger : MonoBehaviour
                     if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
                     scen.vesselZoomEntries.Add(kvZoom.Key + "|" + kvZoom.Value.ToString(CultureInfo.InvariantCulture));
                 }
-                
-                try
-                {
-                    var saveNode = new ConfigNode("CAMERASWITCHER_SAVE");
-                    scen.OnSave(saveNode);
-                }
-                catch { }
             }
         }
         catch (Exception e)
