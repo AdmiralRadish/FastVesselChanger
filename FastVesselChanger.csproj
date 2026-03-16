@@ -14,7 +14,7 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     
     <!-- KSPBuildTools Configuration -->
-    <KSPBT_ModRoot>$(MSBuildThisFileDirectory)/../GameData/$(MSBuildProjectName)</KSPBT_ModRoot>
+    <KSPBT_ModRoot>$(MSBuildThisFileDirectory)/GameData/$(MSBuildProjectName)</KSPBT_ModRoot>
     <KSPBT_ModPluginFolder>Plugins</KSPBT_ModPluginFolder>
     <KSPBT_DeleteTemplateFiles>false</KSPBT_DeleteTemplateFiles>
   </PropertyGroup>
@@ -58,14 +58,7 @@
     <PackageReference Include="KSPBuildTools" Version="1.1.1" />
   </ItemGroup>
 
-  <!-- Source Files -->
-  <ItemGroup>
-    <Compile Include="..\Source\FastVesselChanger.cs" />
-    <Compile Include="..\Source\FVCHullcam.cs" />
-    <Compile Include="..\Source\FVCScenario.cs" />
-    <Compile Include="..\Source\FVCLunaHelper.cs" />
-    <Compile Include="..\Properties\AssemblyInfo.cs" />
-  </ItemGroup>
+  <!-- Source files are auto-included by SDK default globbing (Source/*.cs, Properties/*.cs) -->
   <ItemGroup>
     <None Include="FastVesselChanger.csproj.user" />
   </ItemGroup>

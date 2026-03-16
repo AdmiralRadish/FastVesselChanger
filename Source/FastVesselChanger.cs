@@ -78,10 +78,11 @@ public partial class FastVesselChanger : MonoBehaviour
 
     // Per-vessel zoom levels — keyed by vessel ID, survives vessel switches within a session
     private static Dictionary<Guid, float> _vesselZooms = new Dictionary<Guid, float>();
-    // Pending zoom — applied every frame in Update() for up to N frames after a vessel switch
+    // Pending zoom — applied every frame in Update() until the target vessel is active or timeout
     private static Guid _pendingZoomVesselId = Guid.Empty;
     private static float _pendingZoom = 0f;
-    private static int _zoomRestoreFrames = 0;
+    private static bool _pendingZoomRestore = false;
+    private static bool _pendingZoomLoggedFirstFrame = false;
     private static float _pendingZoomDeadlineRealtime = 0f;
     private static Guid _zoomLockoutVesselId = Guid.Empty;
     private static float _zoomLockoutTarget = 0f;
@@ -116,13 +117,18 @@ public partial class FastVesselChanger : MonoBehaviour
     private bool _twitchWriterStartupLogged = false;
     private bool _writeLMPPlayersLog = false;  // persist to XML user prefs
     private bool _writeVesselLog = false;      // persist to XML user prefs
-    private static readonly bool VERBOSE_DIAGNOSTICS = true;
+    private static readonly bool VERBOSE_DIAGNOSTICS = false;
     private const string TWITCH_PLAYERS_FILE = "players_online.txt";
     private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
     private const float TWITCH_WRITE_INTERVAL = 15f;
 
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
+
+    // Cached sorted vessel list for OnGUI — rebuilt only when vessel count changes
+    private List<Vessel> _cachedSortedVessels = new List<Vessel>();
+    private int _cachedVesselCount = -1;
+
     // HullcamVDS fields are declared in FastVesselChanger.Hullcam.cs (partial class)
 
     void Awake()
@@ -203,12 +209,9 @@ public partial class FastVesselChanger : MonoBehaviour
                 selected.Clear();
                 foreach (var id in scen.selectedVesselIds)
                 {
-                    try
-                    {
-                        var g = new Guid(id);
+                    Guid g;
+                    if (Guid.TryParse(id, out g))
                         selected[g] = true;
-                    }
-                    catch { }
                 }
 
                 _vesselZooms.Clear();
@@ -390,6 +393,8 @@ public partial class FastVesselChanger : MonoBehaviour
         _uiHoldCoroutine = StartCoroutine(HoldUIHidden());
     }
 
+    private static readonly WaitForSeconds _uiHoldWait = new WaitForSeconds(0.1f);
+
     IEnumerator HoldUIHidden()
     {
         float deadline = Time.time + 6f; // cover full vessel load pipeline
@@ -399,7 +404,7 @@ public partial class FastVesselChanger : MonoBehaviour
                 InvokeHideUI();
             else
                 yield break; // user chose to show — stop fighting it
-            yield return null; // suppress every frame — eliminates frame gaps where UI can flash
+            yield return _uiHoldWait; // 10 Hz — enough to catch any KSP show-UI event
         }
         _uiHoldCoroutine = null;
     }
@@ -467,13 +472,13 @@ public partial class FastVesselChanger : MonoBehaviour
 
         // Zoom restore — pre-seed as soon as target is active, then hard-lock briefly
         // to suppress transition-time camera systems from overriding the restore.
-        if (_zoomRestoreFrames > 0 && _pendingZoomVesselId != Guid.Empty)
+        if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty)
         {
             if (Time.realtimeSinceStartup > _pendingZoomDeadlineRealtime)
             {
                 VerboseLog("[FastVesselChanger] RestoreZoom timeout: target vessel did not become ready before deadline", warning: true);
                 _pendingZoomVesselId = Guid.Empty;
-                _zoomRestoreFrames = 0;
+                _pendingZoomRestore = false;
                 _pendingZoomDeadlineRealtime = 0f;
             }
 
@@ -496,17 +501,20 @@ public partial class FastVesselChanger : MonoBehaviour
                     }
 
                     // Log on the very first frame so we can see what's available
-                    if (_zoomRestoreFrames == 240)
+                    if (!_pendingZoomLoggedFirstFrame)
+                    {
+                        _pendingZoomLoggedFirstFrame = true;
                         VerboseLog("[FastVesselChanger] RestoreZoom start: target=" + _pendingZoom
                             + " current=" + cam.Distance
                             + " camDistField=" + (_camDistField != null ? _camDistField.Name : "NOT FOUND"));
+                    }
 
-                    // Option A: pre-seed immediately when the target vessel becomes active.
+                    // Pre-seed immediately when the target vessel becomes active.
                     cam.SetDistanceImmediate(_pendingZoom);
                     _camDistField?.SetValue(cam, _pendingZoom);
                     VerboseLog("[FastVesselChanger] RestoreZoom pre-seed applied: target=" + _pendingZoom + " final=" + cam.Distance);
 
-                    // Option C: aggressive lockout window — keep forcing zoom to block user scroll
+                    // Aggressive lockout window — keep forcing zoom to block user scroll
                     // and other camera writers during the immediate post-load transition.
                     _zoomLockoutVesselId = _pendingZoomVesselId;
                     _zoomLockoutTarget = _pendingZoom;
@@ -515,14 +523,17 @@ public partial class FastVesselChanger : MonoBehaviour
 
                     // Pending restore is consumed; lockout enforces the value for a short window.
                     _pendingZoomVesselId = Guid.Empty;
-                    _zoomRestoreFrames = 0;
+                    _pendingZoomRestore = false;
                     _pendingZoomDeadlineRealtime = 0f;
                 }
                 else
                 {
                     // Camera not ready yet — keep waiting until realtime deadline.
-                    if (_zoomRestoreFrames == 240)
-                        VerboseLog("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null on frame 240", warning: true);
+                    if (!_pendingZoomLoggedFirstFrame)
+                    {
+                        _pendingZoomLoggedFirstFrame = true;
+                        VerboseLog("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null, waiting...", warning: true);
+                    }
                 }
             }
             else
@@ -661,7 +672,9 @@ public partial class FastVesselChanger : MonoBehaviour
         GUILayout.BeginVertical();
 
         // ---- Vessel List ----
-        int selectedCount = selected.Values.Count(v => v);
+        int selectedCount = 0;
+        foreach (bool sel in selected.Values)
+            if (sel) selectedCount++;
         GUILayout.BeginHorizontal();
         GUILayout.Label("Vessels (" + selectedCount + " selected):");
         GUILayout.FlexibleSpace();
@@ -710,12 +723,22 @@ public partial class FastVesselChanger : MonoBehaviour
 
         scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.Height(BASE_SCROLL_HEIGHT));
 
-        string searchLower = vesselSearchText.ToLowerInvariant();
+        // Rebuild cached sorted vessel list only when vessel count changes
+        int currentVesselCount = FlightGlobals.Vessels.Count;
+        if (currentVesselCount != _cachedVesselCount)
+        {
+            _cachedVesselCount = currentVesselCount;
+            _cachedSortedVessels.Clear();
+            foreach (var sv in FlightGlobals.Vessels)
+                if (sv != null) _cachedSortedVessels.Add(sv);
+            _cachedSortedVessels.Sort((a, b) => string.Compare(a.vesselName, b.vesselName, StringComparison.OrdinalIgnoreCase));
+        }
+
         bool anyVisible = false;
-        foreach (Vessel v in FlightGlobals.Vessels.Where(v => v != null).OrderBy(v => v.vesselName))
+        foreach (Vessel v in _cachedSortedVessels)
         {
             if (!IsVesselTypeEnabled(v.vesselType.ToString())) continue;
-            if (!string.IsNullOrEmpty(vesselSearchText) && !v.vesselName.ToLowerInvariant().Contains(searchLower)) continue;
+            if (!string.IsNullOrEmpty(vesselSearchText) && v.vesselName.IndexOf(vesselSearchText, StringComparison.OrdinalIgnoreCase) < 0) continue;
 
             anyVisible = true;
             bool prev = false;
@@ -777,11 +800,10 @@ public partial class FastVesselChanger : MonoBehaviour
             GUILayout.BeginHorizontal();
             if (GUILayout.Button("Select Visible", GUILayout.ExpandWidth(true)))
             {
-                string searchLowerSel = vesselSearchText.ToLowerInvariant();
-                foreach (Vessel sv in FlightGlobals.Vessels.Where(sv => sv != null))
+                foreach (Vessel sv in _cachedSortedVessels)
                 {
                     if (!IsVesselTypeEnabled(sv.vesselType.ToString())) continue;
-                    if (!string.IsNullOrEmpty(vesselSearchText) && !sv.vesselName.ToLowerInvariant().Contains(searchLowerSel)) continue;
+                    if (!string.IsNullOrEmpty(vesselSearchText) && sv.vesselName.IndexOf(vesselSearchText, StringComparison.OrdinalIgnoreCase) < 0) continue;
                     selected[sv.id] = true;
                 }
                 SaveToScenario();
@@ -1008,12 +1030,9 @@ public partial class FastVesselChanger : MonoBehaviour
             {
                 foreach (var id in scen.selectedVesselIds)
                 {
-                    try
-                    {
-                        var g = new Guid(id);
-                        if (existing.Contains(g)) selected[g] = true;
-                    }
-                    catch { }
+                    Guid g;
+                    if (Guid.TryParse(id, out g) && existing.Contains(g))
+                        selected[g] = true;
                 }
             }
         }
@@ -1265,8 +1284,9 @@ public partial class FastVesselChanger : MonoBehaviour
             _zoomLockoutUntilRealtime = 0f;
             _pendingZoomVesselId = v.id;
             _pendingZoom = savedZoom;
-            _zoomRestoreFrames = 240; // ~4s at 60fps — covers full vessel load pipeline
-            _pendingZoomDeadlineRealtime = Time.realtimeSinceStartup + 20f;
+            _pendingZoomRestore = true;
+            _pendingZoomLoggedFirstFrame = false;
+            _pendingZoomDeadlineRealtime = Time.realtimeSinceStartup + 30f;
             VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + savedZoom);
         }
         else
@@ -1517,9 +1537,10 @@ public partial class FastVesselChanger : MonoBehaviour
                     foreach (var fid in hs.selectedFlightIds)
                         scen.vesselHullcamSelectedCams.Add(kvHc.Key + "|" + fid);
                 }
-                Debug.Log("[FastVesselChanger] SaveToScenario: hullcamEntries=" + scen.vesselHullcamEntries.Count
-                    + " hullcamCams=" + scen.vesselHullcamSelectedCams.Count
-                    + " (activeVesselSelectedIds=" + _hullcamSelectedIds.Count + ")");
+                if (VERBOSE_DIAGNOSTICS)
+                    Debug.Log("[FastVesselChanger] SaveToScenario: hullcamEntries=" + scen.vesselHullcamEntries.Count
+                        + " hullcamCams=" + scen.vesselHullcamSelectedCams.Count
+                        + " (activeVesselSelectedIds=" + _hullcamSelectedIds.Count + ")");
             }
         }
         catch (Exception e)

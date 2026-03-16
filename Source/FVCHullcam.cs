@@ -31,6 +31,11 @@ public partial class FastVesselChanger
     // Per-vessel hull cam settings (static, survives vessel-switch addon recreation like _vesselZooms)
     private static Dictionary<Guid, VesselHullcamSettings> _vesselHullcamSettings = new Dictionary<Guid, VesselHullcamSettings>();
 
+    // Cached hull cam list for the active vessel — avoids re-scanning parts every OnGUI call.
+    // Invalidated when vessel changes (checked via ID) or when RebuildHullCamRotation is called.
+    private List<HullCamEntry> _cachedVesselCams = new List<HullCamEntry>();
+    private Guid _cachedVesselCamsId = Guid.Empty;
+
     // Hull cam state for the active vessel (instance — reset on each addon recreation)
     private bool _hullcamAutoActive = false;
     private float _hullcamInterval = 10f;
@@ -78,8 +83,6 @@ public partial class FastVesselChanger
         foreach (var asm in allAsms)
         {
             var shortName = asm.GetName().Name;
-            // Log every assembly so we can confirm HullcamVDSContinued is present
-            Debug.Log("[FastVesselChanger] HullcamVDS scan: asm='" + shortName + "'");
 
             // Match by assembly short name — HullcamVDS ships as "HullcamVDSContinued"
             if (shortName != "HullcamVDSContinued" && shortName != "HullcamVDS" && shortName != "HullCameraVDS")
@@ -232,6 +235,18 @@ public partial class FastVesselChanger
             _hullcamActivateMethod.Invoke(module, null);
             _hullcamLastActivatedModule = module;
             Debug.Log("[FastVesselChanger] ActivateHullCam: success");
+
+            // Cancel any pending zoom restore — FlightCamera.fetch will be null while a
+            // hull cam owns the camera, so the zoom restore loop in Update() would spin
+            // uselessly (and in older builds, flood the log every frame causing a hang).
+            // Zoom is handled separately by RestoreZoomAfterHullcamDeactivate() on deactivation.
+            if (_pendingZoomRestore)
+            {
+                Debug.Log("[FastVesselChanger] ActivateHullCam: cancelling pending zoom restore (hull cam now owns camera)");
+                _pendingZoomRestore = false;
+                _pendingZoomVesselId = Guid.Empty;
+                _pendingZoomDeadlineRealtime = 0f;
+            }
         }
         catch (Exception e) { Debug.LogWarning("[FastVesselChanger] HullCam ActivateCamera failed: " + e.GetType().Name + ": " + e.Message); }
     }
@@ -278,6 +293,8 @@ public partial class FastVesselChanger
     void RebuildHullCamRotation(Vessel v)
     {
         _hullcamRotation.Clear();
+        // Invalidate the hull cam cache so DrawHullcamSection re-scans on next frame
+        _cachedVesselCamsId = Guid.Empty;
         if (_hullcamIncludeExternal)
             _hullcamRotation.Add(null); // null slot = external / standard orbit camera
         if (v != null)
@@ -467,7 +484,13 @@ public partial class FastVesselChanger
         if (!_hullcamInstalled) return;
 
         var hcVessel = FlightGlobals.ActiveVessel;
-        var vesselCams = hcVessel != null ? GetHullCamsOnVessel(hcVessel) : new List<HullCamEntry>();
+        var hcVesselId = hcVessel?.id ?? Guid.Empty;
+        if (hcVesselId != _cachedVesselCamsId)
+        {
+            _cachedVesselCamsId = hcVesselId;
+            _cachedVesselCams = hcVessel != null ? GetHullCamsOnVessel(hcVessel) : new List<HullCamEntry>();
+        }
+        var vesselCams = _cachedVesselCams;
         bool hcVisible = vesselCams.Count > 0;
         if (hcVisible != _lastHullcamSectionVisible)
         {

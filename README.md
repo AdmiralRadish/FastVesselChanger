@@ -8,7 +8,7 @@ This project uses **KSPBuildTools** to automatically manage KSP DLLs and plugin 
 Before building, you must configure your KSP installation path:
 
 1. **Option A: Using csproj.user file (Recommended)**
-   - Copy `FastVesselChanger/FastVesselChanger.csproj.user.example` to `FastVesselChanger/FastVesselChanger.csproj.user`
+   - Copy `FastVesselChanger.csproj.user.example` to `FastVesselChanger.csproj.user`
    - Edit the `.csproj.user` file and set `KSPBT_GameRoot` to your KSP installation directory (the one containing `GameData`)
    - Example: `C:\Games\KSP_1.12.5` or `D:\SteamLibrary\steamapps\common\Kerbal Space Program`
 
