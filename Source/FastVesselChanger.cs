@@ -8,442 +8,15 @@ using System.Linq;
 using System.Xml;
 using UnityEngine;
 
-#pragma warning disable CS8618, CS8600, CS8601, CS8625
+#pragma warning disable CS8618, CS8600, CS8601, CS8625, CS8603, CS8604
 
-/// <summary>
-/// Helper class to detect and interact with LunaMultiplayer server
-/// Prefixed FVC to avoid type-name collision with identically-named helpers
-/// in other KSP mods loaded into the same AppDomain.
-/// </summary>
-public static class FVCLunaHelper
-{
-    private static bool? _isLunaAvailable = null;
-    private static string _cachedPlayerName = null;
+// FVCLunaHelper is defined in FVCLunaHelper.cs
+// FastVesselChangerScenario and FVCPersistenceHelpers are defined in FVCScenario.cs
+// HullcamVDS integration (fields, types, methods) is in FVCHullcam.cs
 
-    /// <summary>
-    /// Check if LunaMultiplayer is installed and active
-    /// </summary>
-    public static bool IsLunaEnabled
-    {
-        get
-        {
-            if (_isLunaAvailable == null)
-            {
-                _isLunaAvailable = DetectLunaMultiplayer();
-            }
-            return _isLunaAvailable.Value;
-        }
-    }
-
-    private static bool DetectLunaMultiplayer()
-    {
-        try
-        {
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-            foreach (var a in assemblies)
-            {
-                // Look for LunaMultiplayer assemblies
-                var assemblyName = a.GetName().Name ?? string.Empty;
-                if (assemblyName.IndexOf("LunaMultiplayer", StringComparison.OrdinalIgnoreCase) >= 0
-                    || assemblyName.Equals("LMP.Client", StringComparison.OrdinalIgnoreCase)
-                    || assemblyName.Equals("LmpClient", StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-            }
-        }
-        catch { }
-        return false;
-    }
-
-    /// <summary>
-    /// Get the current player's username from LunaMultiplayer
-    /// Falls back to "SinglePlayer" if Luna is not available
-    /// </summary>
-    public static string GetCurrentPlayerName()
-    {
-        if (_cachedPlayerName != null)
-        {
-            if (!string.Equals(_cachedPlayerName, "SinglePlayer", StringComparison.OrdinalIgnoreCase) || !IsLunaEnabled)
-                return _cachedPlayerName;
-
-            // If Luna is enabled and we previously fell back to SinglePlayer,
-            // retry resolution because the client may not have been fully initialized yet.
-            _cachedPlayerName = null;
-        }
-
-        try
-        {
-            if (IsLunaEnabled)
-            {
-                // Strategy 1: Try Main.MyPlayer.PlayerName
-                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-                Type mainType = null;
-
-                foreach (var a in assemblies)
-                {
-                    mainType = a.GetType("LunaMultiplayer.Client.Main");
-                    if (mainType == null) mainType = a.GetType("LMP.Client.Main");
-                    if (mainType != null) break;
-                }
-
-                if (mainType != null)
-                {
-                    // Get MyPlayer property
-                    var myPlayerProp = mainType.GetProperty("MyPlayer", BindingFlags.Public | BindingFlags.Static);
-                    if (myPlayerProp != null)
-                    {
-                        var myPlayer = myPlayerProp.GetValue(null);
-                        if (myPlayer != null)
-                        {
-                            string? resolvedName = ExtractStringMember(myPlayer, "PlayerName")
-                                                ?? ExtractStringMember(myPlayer, "Name")
-                                                ?? ExtractStringMember(myPlayer, "UserName")
-                                                ?? ExtractStringMember(myPlayer, "Username");
-                            if (!string.IsNullOrWhiteSpace(resolvedName))
-                            {
-                                _cachedPlayerName = SanitizePlayerName(resolvedName!);
-                                Debug.Log("[FastVesselChanger] Detected Luna player: " + _cachedPlayerName);
-                                return _cachedPlayerName;
-                            }
-                        }
-                    }
-                }
-
-                // Strategy 2: Try SettingsSystem.CurrentSettings.PlayerName (LMP client source of truth)
-                foreach (var a in assemblies)
-                {
-                    Type settingsType = a.GetType("LmpClient.Systems.SettingsSys.SettingsSystem")
-                                      ?? a.GetType("LMP.Client.Systems.Settings.SettingsSystem")
-                                      ?? a.GetType("LunaMultiplayer.Client.Systems.SettingsSys.SettingsSystem");
-                    if (settingsType == null) continue;
-
-                    object? currentSettings = null;
-                    var currentSettingsProp = settingsType.GetProperty("CurrentSettings", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                    if (currentSettingsProp != null)
-                    {
-                        try { currentSettings = currentSettingsProp.GetValue(null, null); } catch { }
-                    }
-
-                    if (currentSettings == null)
-                    {
-                        var singletonProp = settingsType.GetProperty("Singleton", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
-                                        ?? settingsType.GetProperty("Instance", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                        if (singletonProp != null)
-                        {
-                            object? singleton = null;
-                            try { singleton = singletonProp.GetValue(null, null); } catch { }
-                            if (singleton != null)
-                            {
-                                var instanceCurrentSettings = singleton.GetType().GetProperty("CurrentSettings", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
-                                if (instanceCurrentSettings != null)
-                                {
-                                    try { currentSettings = instanceCurrentSettings.GetValue(singleton, null); } catch { }
-                                }
-                            }
-                        }
-                    }
-
-                    if (currentSettings != null)
-                    {
-                        string? resolvedName = ExtractStringMember(currentSettings, "PlayerName")
-                                            ?? ExtractStringMember(currentSettings, "Name")
-                                            ?? ExtractStringMember(currentSettings, "UserName")
-                                            ?? ExtractStringMember(currentSettings, "Username");
-                        if (!string.IsNullOrWhiteSpace(resolvedName))
-                        {
-                            _cachedPlayerName = SanitizePlayerName(resolvedName!);
-                            Debug.Log("[FastVesselChanger] Detected Luna player (settings): " + _cachedPlayerName);
-                            return _cachedPlayerName;
-                        }
-                    }
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning("[FastVesselChanger] Error detecting Luna player name: " + e.Message);
-        }
-
-        // Fallback to single-player mode. Only cache this when Luna is not enabled,
-        // so we keep retrying player detection while Luna initializes.
-        if (!IsLunaEnabled)
-            _cachedPlayerName = "SinglePlayer";
-
-        return "SinglePlayer";
-    }
-
-    private static string? ExtractStringMember(object source, string memberName)
-    {
-        if (source == null || string.IsNullOrEmpty(memberName))
-            return null;
-
-        var type = source.GetType();
-        var prop = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        if (prop != null && prop.PropertyType == typeof(string))
-        {
-            try { return prop.GetValue(source, null) as string; } catch { }
-        }
-
-        var field = type.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        if (field != null && field.FieldType == typeof(string))
-        {
-            try { return field.GetValue(source) as string; } catch { }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Sanitize player name for use as a config key (remove special characters)
-    /// </summary>
-    private static string SanitizePlayerName(string playerName)
-    {
-        // Remove/replace characters that might break config parsing
-        System.Text.StringBuilder sb = new System.Text.StringBuilder();
-        foreach (char c in playerName)
-        {
-            if (char.IsLetterOrDigit(c) || c == '_' || c == '-')
-            {
-                sb.Append(c);
-            }
-            else
-            {
-                sb.Append('_'); // Replace invalid chars with underscore
-            }
-        }
-        return sb.ToString();
-    }
-
-    /// <summary>
-    /// Clear cached player name when switching servers/players
-    /// Call this in relevant game events or on player switch
-    /// </summary>
-    public static void ClearCache()
-    {
-        _cachedPlayerName = null;
-    }
-}
-
-// Persistence scenario module stores settings in the KSP save under SCENARIO
-// Supports both single-player and LunaMultiplayer servers with per-player settings
-[KSPScenario(ScenarioCreationOptions.AddToAllGames, GameScenes.FLIGHT)]
-public class FastVesselChangerScenario : ScenarioModule
-{
-    public int switchInterval = 300;
-    public bool autoEnabled = false;
-    public bool showWindow = true;
-    public bool uiVisible = true;
-    public bool cameraRotEnabled = false;
-    public bool cameraRotRandomEnabled = false;
-    public float cameraRotXRate = 0f;   // pitch deg/s (positive = up)
-    public float cameraRotYRate = 0f;   // orbit deg/s (positive = right)
-    public List<string> selectedVesselIds = new List<string>();
-    public List<string> selectedVesselTypes = new List<string>();
-    public List<string> shuffleRemainingVesselIds = new List<string>();
-    public List<string> vesselZoomEntries = new List<string>();
-
-    public static FastVesselChangerScenario Instance { get; private set; }
-
-    /// <summary>
-    /// Get the current player identifier for scenario storage
-    /// Returns player name for multiplayer, "SinglePlayer" for single player
-    /// </summary>
-    private string GetPlayerKey()
-    {
-        return FVCLunaHelper.GetCurrentPlayerName();
-    }
-
-    /// <summary>
-    /// Create a config key with player prefix for multiplayer compatibility
-    /// Example: "Player1_selectedVesselId" or "SinglePlayer_switchInterval"
-    /// </summary>
-    private string MakePlayerKey(string baseKey)
-    {
-        return GetPlayerKey() + "_" + baseKey;
-    }
-
-    public override void OnSave(ConfigNode node)
-    {
-        base.OnSave(node);
-        try
-        {
-            string playerPrefix = GetPlayerKey();
-
-            // Save settings with player prefix
-            string switchIntervalKey = MakePlayerKey("switchInterval");
-            string autoEnabledKey = MakePlayerKey("autoEnabled");
-            string showWindowKey = MakePlayerKey("showWindow");
-            
-            node.SetValue(switchIntervalKey, switchInterval.ToString(), true);
-            node.SetValue(autoEnabledKey, autoEnabled.ToString(), true);
-            node.SetValue(showWindowKey, showWindow.ToString(), true);
-            node.SetValue(MakePlayerKey("uiVisible"), uiVisible.ToString(), true);
-            node.SetValue(MakePlayerKey("cameraRotEnabled"), cameraRotEnabled.ToString(), true);
-            node.SetValue(MakePlayerKey("cameraRotRandomEnabled"), cameraRotRandomEnabled.ToString(), true);
-            node.SetValue(MakePlayerKey("cameraRotXRate"), cameraRotXRate.ToString(), true);
-            node.SetValue(MakePlayerKey("cameraRotYRate"), cameraRotYRate.ToString(), true);
-
-            // Save vessel selections (each as a separate value)
-            string vesselIdPrefix = MakePlayerKey("selectedVesselId");
-            foreach (var id in selectedVesselIds)
-            {
-                node.AddValue(vesselIdPrefix, id);
-            }
-
-            // Save vessel type filters
-            string vesselTypePrefix = MakePlayerKey("selectedVesselType");
-            foreach (var type in selectedVesselTypes)
-            {
-                node.AddValue(vesselTypePrefix, type);
-            }
-
-            // Save shuffle-bag remainder so vessel-switch reloads keep the current round intact
-            string shuffleRemainingPrefix = MakePlayerKey("shuffleRemainingVesselId");
-            foreach (var id in shuffleRemainingVesselIds)
-            {
-                node.AddValue(shuffleRemainingPrefix, id);
-            }
-
-            // Save per-vessel zoom levels
-            string vesselZoomPrefix = MakePlayerKey("vesselZoom");
-            foreach (var entry in vesselZoomEntries)
-            {
-                node.AddValue(vesselZoomPrefix, entry);
-            }
-
-            Debug.Log("[FastVesselChanger] Saved settings for player: " + playerPrefix);
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("[FastVesselChanger] Scenario OnSave error: " + e.Message);
-        }
-    }
-
-    public override void OnLoad(ConfigNode node)
-    {
-        base.OnLoad(node);
-        try
-        {
-            selectedVesselIds.Clear();
-            selectedVesselTypes.Clear();
-            shuffleRemainingVesselIds.Clear();
-            vesselZoomEntries.Clear();
-            
-            string playerPrefix = GetPlayerKey();
-
-            // Load settings with player prefix
-            string switchIntervalKey = MakePlayerKey("switchInterval");
-            string autoEnabledKey = MakePlayerKey("autoEnabled");
-            string showWindowKey = MakePlayerKey("showWindow");
-
-            if (node.HasValue(switchIntervalKey))
-            {
-                int.TryParse(node.GetValue(switchIntervalKey), out switchInterval);
-            }
-            if (node.HasValue(autoEnabledKey))
-            {
-                bool.TryParse(node.GetValue(autoEnabledKey), out autoEnabled);
-            }
-            if (node.HasValue(showWindowKey))
-            {
-                bool.TryParse(node.GetValue(showWindowKey), out showWindow);
-            }
-            string uiVisibleKey = MakePlayerKey("uiVisible");
-            if (node.HasValue(uiVisibleKey))
-                bool.TryParse(node.GetValue(uiVisibleKey), out uiVisible);
-            string camRotEnabledKey = MakePlayerKey("cameraRotEnabled");
-            if (node.HasValue(camRotEnabledKey))
-                bool.TryParse(node.GetValue(camRotEnabledKey), out cameraRotEnabled);
-            string camRotRandomKey = MakePlayerKey("cameraRotRandomEnabled");
-            if (node.HasValue(camRotRandomKey))
-                bool.TryParse(node.GetValue(camRotRandomKey), out cameraRotRandomEnabled);
-            string camRotXKey = MakePlayerKey("cameraRotXRate");
-            if (node.HasValue(camRotXKey))
-                float.TryParse(node.GetValue(camRotXKey), out cameraRotXRate);
-            string camRotYKey = MakePlayerKey("cameraRotYRate");
-            if (node.HasValue(camRotYKey))
-                float.TryParse(node.GetValue(camRotYKey), out cameraRotYRate);
-
-            // Load vessel selections
-            string vesselIdPrefix = MakePlayerKey("selectedVesselId");
-            foreach (var v in node.GetValues(vesselIdPrefix))
-            {
-                if (!string.IsNullOrEmpty(v)) selectedVesselIds.Add(v);
-            }
-
-            // Load vessel type filters
-            string vesselTypePrefix = MakePlayerKey("selectedVesselType");
-            foreach (var t in node.GetValues(vesselTypePrefix))
-            {
-                if (!string.IsNullOrEmpty(t)) selectedVesselTypes.Add(t);
-            }
-
-            // Load shuffle-bag remainder
-            string shuffleRemainingPrefix = MakePlayerKey("shuffleRemainingVesselId");
-            foreach (var id in node.GetValues(shuffleRemainingPrefix))
-            {
-                if (!string.IsNullOrEmpty(id)) shuffleRemainingVesselIds.Add(id);
-            }
-
-            // Load per-vessel zoom levels
-            string vesselZoomPrefix = MakePlayerKey("vesselZoom");
-            foreach (var z in node.GetValues(vesselZoomPrefix))
-            {
-                if (!string.IsNullOrEmpty(z)) vesselZoomEntries.Add(z);
-            }
-
-            Debug.Log("[FastVesselChanger] Loaded settings for player: " + playerPrefix + 
-                     " (vessels: " + selectedVesselIds.Count + ", types: " + selectedVesselTypes.Count + ", remaining: " + shuffleRemainingVesselIds.Count + ", zooms: " + vesselZoomEntries.Count + ")");
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("[FastVesselChanger] Scenario OnLoad error: " + e.Message);
-        }
-    }
-
-    public override void OnAwake()
-    {
-        base.OnAwake();
-        Instance = this;
-    }
-}
-
-// Prefixed FVC to avoid type-name collision with identically-named helpers in other mods.
-public static class FVCPersistenceHelpers
-{
-    // Serialize a list of Guids to a list of strings
-    public static List<string> SerializeGuidList(List<Guid> guids)
-    {
-        var outList = new List<string>();
-        if (guids == null) return outList;
-        foreach (var g in guids)
-        {
-            outList.Add(g.ToString());
-        }
-        return outList;
-    }
-
-    // Parse list of GUID strings to Guid list (invalid entries are skipped)
-    public static List<Guid> ParseGuidList(List<string> strs)
-    {
-        var outList = new List<Guid>();
-        if (strs == null) return outList;
-        foreach (var s in strs)
-        {
-            try
-            {
-                var g = new Guid(s);
-                outList.Add(g);
-            }
-            catch { }
-        }
-        return outList;
-    }
-}
 
 [KSPAddon(KSPAddon.Startup.Flight, false)]
-public class FastVesselChanger : MonoBehaviour
+public partial class FastVesselChanger : MonoBehaviour
 {
     private static FastVesselChanger _activeInstance;
     private const string USER_PREFS_FILE_NAME = "FastVesselChanger.xml";
@@ -513,8 +86,9 @@ public class FastVesselChanger : MonoBehaviour
     private static Guid _zoomLockoutVesselId = Guid.Empty;
     private static float _zoomLockoutTarget = 0f;
     private static float _zoomLockoutUntilRealtime = 0f;
-    private static FieldInfo _camDistField = null; // cached reflection handle
-    private const float ZOOM_LOCKOUT_SECONDS = 2.0f;
+    private static FieldInfo _camDistField = null;  // cached reflection handle for FlightCamera.distance
+    private static bool _camDistFieldSearched = false; // true once we've attempted the lookup
+    private const float ZOOM_LOCKOUT_SECONDS = 1.0f;
 
     // Cached reflection handles for UIMasterController (the class that actually hides/shows KSP's HUD).
     // _uiMasterInstance is resolved lazily on first use because UIMasterController.Instance is not
@@ -530,6 +104,10 @@ public class FastVesselChanger : MonoBehaviour
     private object _appButton = null;
     private static object _sharedAppButton = null;
     private bool _isAddingAppButton = false;
+    // Cache for app button SetTrue/SetFalse methods — discovered once per session
+    private static MethodInfo _appButtonSetTrueMethod  = null;
+    private static MethodInfo _appButtonSetFalseMethod = null;
+    private static bool _appButtonMethodsSearched = false;
     private Coroutine _retryButtonCoroutine = null;
     private Coroutine _cameraPitchOverrideCoroutine = null;
 
@@ -538,13 +116,14 @@ public class FastVesselChanger : MonoBehaviour
     private bool _twitchWriterStartupLogged = false;
     private bool _writeLMPPlayersLog = false;  // persist to XML user prefs
     private bool _writeVesselLog = false;      // persist to XML user prefs
-    private static readonly bool VERBOSE_DIAGNOSTICS = false;
+    private static readonly bool VERBOSE_DIAGNOSTICS = true;
     private const string TWITCH_PLAYERS_FILE = "players_online.txt";
     private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
     private const float TWITCH_WRITE_INTERVAL = 15f;
 
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
+    // HullcamVDS fields are declared in FastVesselChanger.Hullcam.cs (partial class)
 
     void Awake()
     {
@@ -676,6 +255,18 @@ public class FastVesselChanger : MonoBehaviour
             SaveToScenario();
         }
 
+        // Detect HullcamVDS and restore hull cam state for the active vessel.
+        // DetectHullcamVDS is idempotent (static flag) so it's safe to call on every addon recreation.
+        DetectHullcamVDS();
+        LoadHullcamSettingsFromScenario(FastVesselChangerScenario.Instance);
+        var hullcamActiveVessel = FlightGlobals.ActiveVessel;
+        // Pin the vessel this instance is responsible for. SyncCurrentHullcamStateToDict()
+        // always writes to this ID, NOT FlightGlobals.ActiveVessel (which changes the moment
+        // SetActiveVessel is called, before OnDestroy fires on the old instance).
+        _instanceVesselId = hullcamActiveVessel?.id ?? Guid.Empty;
+        if (hullcamActiveVessel != null && _hullcamInstalled)
+            ApplyVesselHullcamSettings(hullcamActiveVessel);
+
         // Cache UIMasterController (the class that physically hides/shows KSP's flight HUD)
         CacheUIMasterController();
 
@@ -730,7 +321,6 @@ public class FastVesselChanger : MonoBehaviour
 
     // Resolves UIMasterController.Instance on first successful call and caches it.
     // Called lazily rather than at Start() because KSP assigns the instance after addon startup.
-#pragma warning disable CS8603
     object GetUIMasterInstance()
     {
         if (_uiMasterInstance != null) return _uiMasterInstance;
@@ -739,7 +329,6 @@ public class FastVesselChanger : MonoBehaviour
         catch { }
         return _uiMasterInstance;
     }
-#pragma warning restore CS8603
 
     // Calls UIMasterController.HideUI() — this is what KSP's F2 handler uses internally.
     // We ALSO always fire onHideUI directly because vessel transitions can call
@@ -860,6 +449,7 @@ public class FastVesselChanger : MonoBehaviour
         if (Input.GetKeyDown(KeyCode.Slash))
         {
             showWindow = !showWindow;
+            SyncAppButtonState(showWindow);  // keep toolbar button in sync with key toggle
             SaveToScenario();
         }
 
@@ -893,15 +483,16 @@ public class FastVesselChanger : MonoBehaviour
                 var cam = FlightCamera.fetch;
                 if (cam != null)
                 {
-                    // Cache the backing field once
-                    if (_camDistField == null)
+                    // Cache the backing field once; guard with a sentinel so a failed lookup
+                    // doesn't trigger an expensive GetFields scan on every restore call.
+                    if (!_camDistFieldSearched)
                     {
-                        _camDistField = cam.GetType().GetField("camDistance",
+                        _camDistFieldSearched = true;
+                        // In this version of KSP RSS the backing field is "distance", not "camDistance".
+                        _camDistField = cam.GetType().GetField("distance",
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                        // First time: log all distance-related float fields so we can verify the right name
-                        foreach (var f in cam.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
-                            if (f.FieldType == typeof(float) && f.Name.ToLower().Contains("dist"))
-                                VerboseLog("[FastVesselChanger] FlightCamera float field: " + f.Name + " = " + f.GetValue(cam));
+                        VerboseLog("[FastVesselChanger] FlightCamera distance field lookup: "
+                            + (_camDistField != null ? "found '" + _camDistField.Name + "'" : "NOT FOUND"));
                     }
 
                     // Log on the very first frame so we can see what's available
@@ -980,6 +571,8 @@ public class FastVesselChanger : MonoBehaviour
                     cam.camHdg += cameraRotYRate * Mathf.Deg2Rad * Time.deltaTime;
             }
         }
+
+        UpdateHullcam();
     }
 
     IEnumerator ApplyPitchOverridesEndOfFrame()
@@ -1047,11 +640,13 @@ public class FastVesselChanger : MonoBehaviour
         if (!showWindow) return;
         
         // Force window height recalculation when collapsible sections change
-        if (showTypeFilter != lastShowTypeFilter || showCameraControls != lastShowCameraControls)
+        if (showTypeFilter != lastShowTypeFilter || showCameraControls != lastShowCameraControls
+            || _showHullcamSection != _lastShowHullcamSection)
         {
             windowRect.height = 0; // Reset height to force GUILayout recalculation
             lastShowTypeFilter = showTypeFilter;
             lastShowCameraControls = showCameraControls;
+            _lastShowHullcamSection = _showHullcamSection;
         }
         
         var prevRect = windowRect;
@@ -1361,6 +956,8 @@ public class FastVesselChanger : MonoBehaviour
             GUILayout.EndVertical();
         }
 
+        DrawHullcamSection();
+
         GUILayout.Space(4);
         GUILayout.Label("Tip: Press '/' to toggle this window.");
 
@@ -1602,6 +1199,15 @@ public class FastVesselChanger : MonoBehaviour
             }
         }
 
+        // Save hull cam state for the vessel we're leaving.
+        // Do NOT call DeactivateCurrentHullCam() — the FLIGHT→FLIGHT scene reload will destroy
+        // all PartModules and reset HullcamVDS state naturally. Calling deactivate here would
+        // interfere with native hullcam key controls if we haven't personally activated anything.
+        if (_hullcamInstalled)
+        {
+            SyncCurrentHullcamStateToDict();
+        }
+
         // Persist the latest zoom map before triggering FLIGHT->FLIGHT reload.
         SaveToScenario();
 
@@ -1684,9 +1290,9 @@ public class FastVesselChanger : MonoBehaviour
             float x, y;
             do
             {
-                x = isGrounded ? 0f : UnityEngine.Random.Range(-4f, 4f);
-                y = UnityEngine.Random.Range(-4f, 4f);
-            } while (Mathf.Abs(x) + Mathf.Abs(y) < 1.10f);
+                x = isGrounded ? 0f : UnityEngine.Random.Range(-2.0f, 2.0f);
+                y = UnityEngine.Random.Range(-2.0f, 2.0f);
+            } while (Mathf.Abs(x) + Mathf.Abs(y) < 0.90f);
 
             cameraRotXRate = x;
             cameraRotYRate = y;
@@ -1725,6 +1331,8 @@ public class FastVesselChanger : MonoBehaviour
             lastShowCameraControls = showCameraControls;
             showTypeFilter = ParseBool(root["ShowTypeFilter"]?.InnerText, false);
             lastShowTypeFilter = showTypeFilter;
+            _showHullcamSection = ParseBool(root["ShowHullcamSection"]?.InnerText, true);
+            _lastShowHullcamSection = _showHullcamSection;
             _writeLMPPlayersLog = ParseBool(root["WriteLMPPlayersLog"]?.InnerText, false);
             _writeVesselLog = ParseBool(root["WriteVesselLog"]?.InnerText, false);
 
@@ -1775,6 +1383,10 @@ public class FastVesselChanger : MonoBehaviour
             XmlElement showTypeFilterNode = doc.CreateElement("ShowTypeFilter");
             showTypeFilterNode.InnerText = showTypeFilter.ToString();
             root.AppendChild(showTypeFilterNode);
+
+            XmlElement showHullcamSectionNode = doc.CreateElement("ShowHullcamSection");
+            showHullcamSectionNode.InnerText = _showHullcamSection.ToString();
+            root.AppendChild(showHullcamSectionNode);
 
             XmlElement filtersNode = doc.CreateElement("TypeFilters");
             foreach (var kv in vesselTypeFilter.Where(kv => kv.Value))
@@ -1848,7 +1460,10 @@ public class FastVesselChanger : MonoBehaviour
             if (activeVessel != null)
             {
                 var cam = FlightCamera.fetch;
-                if (cam != null)
+                // Only snapshot zoom when the stock FlightCamera is in control.
+                // If a hull cam is active, cam.Distance reflects the hull cam mount
+                // position, not the orbit view distance — don't overwrite the saved value.
+                if (cam != null && _hullcamLastActivatedModule == null)
                     _vesselZooms[activeVessel.id] = cam.Distance;
             }
 
@@ -1889,6 +1504,22 @@ public class FastVesselChanger : MonoBehaviour
                     if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
                     scen.vesselZoomEntries.Add(kvZoom.Key + "|" + kvZoom.Value.ToString(CultureInfo.InvariantCulture));
                 }
+
+                // Sync active vessel's hull cam state to the dict before serializing
+                SyncCurrentHullcamStateToDict();
+                scen.vesselHullcamEntries.Clear();
+                scen.vesselHullcamSelectedCams.Clear();
+                foreach (var kvHc in _vesselHullcamSettings)
+                {
+                    var hs = kvHc.Value;
+                    scen.vesselHullcamEntries.Add(kvHc.Key + "|" + hs.hullcamEnabled + "|" +
+                        hs.hullcamInterval.ToString(CultureInfo.InvariantCulture) + "|" + hs.includeExternal);
+                    foreach (var fid in hs.selectedFlightIds)
+                        scen.vesselHullcamSelectedCams.Add(kvHc.Key + "|" + fid);
+                }
+                Debug.Log("[FastVesselChanger] SaveToScenario: hullcamEntries=" + scen.vesselHullcamEntries.Count
+                    + " hullcamCams=" + scen.vesselHullcamSelectedCams.Count
+                    + " (activeVesselSelectedIds=" + _hullcamSelectedIds.Count + ")");
             }
         }
         catch (Exception e)
@@ -2055,6 +1686,40 @@ public class FastVesselChanger : MonoBehaviour
         }
     }
 
+    // Sync the toolbar button's visual state to match showWindow.
+    // Called when the slash key toggles the window so the button doesn't fall out of sync.
+    // SetTrue(false)/SetFalse(false) change only the visual state; they do NOT re-fire our OnAppTrue/OnAppFalse callbacks.
+    void SyncAppButtonState(bool windowOpen)
+    {
+        if (_appButton == null) return;
+        if (!_appButtonMethodsSearched)
+        {
+            _appButtonMethodsSearched = true;
+            var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var btnType = _appButton.GetType();
+            _appButtonSetTrueMethod  = btnType.GetMethod("SetTrue",  flags);
+            _appButtonSetFalseMethod = btnType.GetMethod("SetFalse", flags);
+            Debug.Log("[FastVesselChanger] SyncAppButtonState: SetTrue=" + (_appButtonSetTrueMethod?.Name ?? "null")
+                + " SetFalse=" + (_appButtonSetFalseMethod?.Name ?? "null"));
+        }
+        try
+        {
+            var method = windowOpen ? _appButtonSetTrueMethod : _appButtonSetFalseMethod;
+            if (method == null) return;
+            var parms = method.GetParameters();
+            // SetTrue/SetFalse may take an optional bool makeCall (default false).
+            // Pass false explicitly so our callbacks are NOT re-invoked.
+            if (parms.Length == 0)
+                method.Invoke(_appButton, null);
+            else
+                method.Invoke(_appButton, new object[] { false });
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] SyncAppButtonState failed: " + e.Message);
+        }
+    }
+
     // Widen FlightCamera pitch limits so stock clamping does not block continuous rotation.
     // Original values are cached and restored when this addon unloads.
     void WidenPitchLimits()
@@ -2122,6 +1787,16 @@ public class FastVesselChanger : MonoBehaviour
             Debug.Log("[FastVesselChanger] Skipping persistence for duplicate destroyed flight addon instance.");
             RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
             return;
+        }
+
+        // Sync hull cam state. No need to call DeactivateCurrentHullCam() here — the scene
+        // teardown destroys all PartModules so HullcamVDS resets itself. Deactivating from
+        // OnDestroy would interfere with native hullcam keys if we never activated anything.
+        if (_hullcamInstalled)
+        {
+            SyncCurrentHullcamStateToDict();
+            if (_hullcamLastActivatedModule != null)
+                DeactivateCurrentHullCam();
         }
 
         SaveToScenario(); // Save state before destroying

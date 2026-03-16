@@ -61,6 +61,9 @@
   <!-- Source Files -->
   <ItemGroup>
     <Compile Include="..\Source\FastVesselChanger.cs" />
+    <Compile Include="..\Source\FVCHullcam.cs" />
+    <Compile Include="..\Source\FVCScenario.cs" />
+    <Compile Include="..\Source\FVCLunaHelper.cs" />
     <Compile Include="..\Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
