@@ -29,4 +29,4 @@ GameData/*/Plugins/*.pdb
 *.htm
 KSP.log
 
-StagingBlocker.netkan
+*.netkan
