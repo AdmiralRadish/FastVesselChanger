@@ -236,6 +236,9 @@ public partial class FastVesselChanger
             _hullcamLastActivatedModule = module;
             Debug.Log("[FastVesselChanger] ActivateHullCam: success");
 
+            // Update camera log file immediately
+            WriteCameraLogFile();
+
             // Cancel any pending zoom restore — FlightCamera.fetch will be null while a
             // hull cam owns the camera, so the zoom restore loop in Update() would spin
             // uselessly (and in older builds, flood the log every frame causing a hang).
@@ -288,6 +291,9 @@ public partial class FastVesselChanger
         }
         catch (Exception e) { Debug.LogWarning("[FastVesselChanger] HullCam deactivate failed: " + e.GetType().Name + ": " + e.Message); }
         _hullcamLastActivatedModule = null;
+
+        // Update camera log file immediately (now showing FlightCamera mode)
+        WriteCameraLogFile();
     }
 
     void RebuildHullCamRotation(Vessel v)
@@ -466,6 +472,30 @@ public partial class FastVesselChanger
 
     void UpdateHullcam()
     {
+        // Detect native hull cam deactivation — the user pressed Escape, O/P past
+        // the camera list, CAMERA_NEXT, or used the part menu to leave hullcam view.
+        // All HullcamVDS exit paths set the static sCurrentCamera to null.  If we
+        // had previously activated a hull cam (_hullcamLastActivatedModule != null)
+        // but sCurrentCamera is now null, the user left via native keys.
+        if (_hullcamInstalled && _hullcamLastActivatedModule != null && _hullcamCurrentCamField != null)
+        {
+            object currentCam = _hullcamCurrentCamField.GetValue(null);
+            if (currentCam == null)
+            {
+                Debug.Log("[FastVesselChanger] UpdateHullcam: native hull cam deactivation detected — restoring zoom");
+                _hullcamLastActivatedModule = null;
+                RestoreZoomAfterHullcamDeactivate();
+                WriteCameraLogFile();
+            }
+            else if (currentCam != _hullcamLastActivatedModule)
+            {
+                // User cycled to a different camera via native keys (O/P).
+                // Track the new module so we stay in sync.
+                _hullcamLastActivatedModule = currentCam;
+                WriteCameraLogFile();
+            }
+        }
+
         // Hull cam auto-cycling — independent of the vessel-switch timer
         if (_hullcamAutoActive && _hullcamInstalled && _hullcamRotation.Count > 0)
         {

@@ -22,7 +22,7 @@ public partial class FastVesselChanger : MonoBehaviour
     private const string USER_PREFS_FILE_NAME = "FastVesselChanger.xml";
 
     // Minimum time (seconds) between any two switches to prevent rapid switching
-    private const double MINIMUM_SWITCH_INTERVAL = 10.0;
+    private const double MINIMUM_SWITCH_INTERVAL = 5.0;
 
     private Rect windowRect = new Rect(20, 80, 400, 500);
     private Vector2 scrollPos = Vector2.zero;
@@ -117,9 +117,11 @@ public partial class FastVesselChanger : MonoBehaviour
     private bool _twitchWriterStartupLogged = false;
     private bool _writeLMPPlayersLog = false;  // persist to XML user prefs
     private bool _writeVesselLog = false;      // persist to XML user prefs
+    private bool _writeCameraLog = false;       // persist to XML user prefs
     private static readonly bool VERBOSE_DIAGNOSTICS = false;
     private const string TWITCH_PLAYERS_FILE = "players_online.txt";
     private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
+    private const string TWITCH_CAMERA_FILE = "CURRENT_CAMERA.txt";
     private const float TWITCH_WRITE_INTERVAL = 15f;
 
     // Guard against multiple switches in the same frame
@@ -295,6 +297,9 @@ public partial class FastVesselChanger : MonoBehaviour
         // stock keyboard controls.
         _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
         _twitchFileWriterCoroutine = StartCoroutine(TwitchFileWriterCoroutine());
+
+        // Write camera log immediately on vessel load so the file reflects the new camera state
+        WriteCameraLogFile();
     }
 
     void CacheUIMasterController()
@@ -303,7 +308,9 @@ public partial class FastVesselChanger : MonoBehaviour
         {
             foreach (var a in AppDomain.CurrentDomain.GetAssemblies())
             {
-                var t = a.GetType("UIMasterController");
+                // KSP's UIMasterController lives in the KSP.UI namespace (Assembly-CSharp).
+                // Assembly.GetType requires the fully-qualified name.
+                var t = a.GetType("KSP.UI.UIMasterController");
                 if (t == null) continue;
 
                 _uiInstanceProp = t.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
@@ -398,13 +405,17 @@ public partial class FastVesselChanger : MonoBehaviour
     IEnumerator HoldUIHidden()
     {
         float deadline = Time.time + 6f; // cover full vessel load pipeline
+        float everyFrameUntil = Time.time + 2f; // every frame for first 2s (critical window)
         while (Time.time < deadline)
         {
             if (!userPreferredUIVisible)
                 InvokeHideUI();
             else
                 yield break; // user chose to show — stop fighting it
-            yield return _uiHoldWait; // 10 Hz — enough to catch any KSP show-UI event
+            if (Time.time < everyFrameUntil)
+                yield return null; // every frame during vessel-load to prevent any flash
+            else
+                yield return _uiHoldWait; // 10 Hz for the remaining hold period
         }
         _uiHoldCoroutine = null;
     }
@@ -458,7 +469,7 @@ public partial class FastVesselChanger : MonoBehaviour
             SaveToScenario();
         }
 
-        if (autoEnabled)
+        if (autoEnabled && FlightGlobals.ready)
         {
             double ut = Planetarium.GetUniversalTime();
             // Enforce both the user-configured interval AND the minimum time
@@ -761,13 +772,13 @@ public partial class FastVesselChanger : MonoBehaviour
             }
             GUILayout.Label(v.vesselName + "  [" + v.vesselType + "]");
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button("GO", GUILayout.Width(30)))
+            if (GUILayout.Button("GO", GUILayout.Width(30)) && FlightGlobals.ready)
             {
                 var currentVessel = FlightGlobals.ActiveVessel;
                 if (currentVessel != null)
                 {
                     var cam = FlightCamera.fetch;
-                    if (cam != null) _vesselZooms[currentVessel.id] = cam.Distance;
+                    if (cam != null && _hullcamLastActivatedModule == null) _vesselZooms[currentVessel.id] = cam.Distance;
                 }
                 shuffleRemaining.RemoveAll(sv => sv != null && sv.id == v.id);
                 SwitchToVessel(v);
@@ -951,27 +962,6 @@ public partial class FastVesselChanger : MonoBehaviour
                 cameraRotYRate = (float)Math.Round(cameraRotYRate + 1f, 1);
                 cameraRotYText = cameraRotYRate.ToString("F1");
                 SaveToScenario();
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.Space(6);
-
-            // ---- Overlay Log Settings ----
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Players log:", GUILayout.Width(100));
-            if (GUILayout.Button(_writeLMPPlayersLog ? "ON" : "OFF", GUILayout.Width(40)))
-            {
-                _writeLMPPlayersLog = !_writeLMPPlayersLog;
-                SaveUserPrefs();
-            }
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Vessel log:", GUILayout.Width(100));
-            if (GUILayout.Button(_writeVesselLog ? "ON" : "OFF", GUILayout.Width(40)))
-            {
-                _writeVesselLog = !_writeVesselLog;
-                SaveUserPrefs();
             }
             GUILayout.EndHorizontal();
 
@@ -1198,6 +1188,12 @@ public partial class FastVesselChanger : MonoBehaviour
     {
         if (v == null) return;
 
+        if (!FlightGlobals.ready)
+        {
+            Debug.LogWarning("[FastVesselChanger] SwitchToVessel aborted: FlightGlobals not ready");
+            return;
+        }
+
         SaveUserPrefs();
 
         bool windowWasVisible = showWindow;
@@ -1207,14 +1203,16 @@ public partial class FastVesselChanger : MonoBehaviour
         if (currentVessel != null)
         {
             var cam = FlightCamera.fetch;
-            if (cam != null)
+            // Only capture zoom when the stock FlightCamera is in control.
+            // If a hull cam is active, cam.Distance is meaningless (hull cam mount, not orbit distance).
+            if (cam != null && _hullcamLastActivatedModule == null)
             {
                 _vesselZooms[currentVessel.id] = cam.Distance;
                 VerboseLog("[FastVesselChanger] Captured zoom before switch: vessel=" + currentVessel.vesselName + " id=" + currentVessel.id + " zoom=" + cam.Distance);
             }
             else
             {
-                VerboseLog("[FastVesselChanger] Could not capture zoom before switch: FlightCamera.fetch is null", warning: true);
+                VerboseLog("[FastVesselChanger] Could not capture zoom before switch: FlightCamera.fetch is null or hull cam active", warning: true);
             }
         }
 
@@ -1229,6 +1227,28 @@ public partial class FastVesselChanger : MonoBehaviour
 
         // Persist the latest zoom map before triggering FLIGHT->FLIGHT reload.
         SaveToScenario();
+
+        // Deactivate the hull cam BEFORE triggering the scene reload.  HullcamVDS
+        // keeps a static `sCurrentCamera` reference to the active camera module.
+        // If we call SetActiveVessel while a hull cam is active, that static ref
+        // survives the FLIGHT→FLIGHT reload but the PartModule it points to is
+        // destroyed, causing NullRefs in FlightGlobals.UpdateInformation and
+        // Waterfall.  Calling LeaveCamera() here, while parts are still alive,
+        // cleanly restores the FlightCamera and clears the static reference.
+        if (_hullcamInstalled && _hullcamLastActivatedModule != null)
+        {
+            DeactivateCurrentHullCam();
+
+            // LeaveCamera() → RestoreMainCamera() leaves the FlightCamera pointing at
+            // whatever angle/distance it had when the hull cam took over.  KSP then
+            // smoothly interpolates from that stale position to the "correct" one on
+            // the new vessel, producing a visible rotation sweep.  Resetting mode to
+            // Auto tells FlightCamera to snap-to rather than lerp, eliminating the
+            // smooth transition artifact.
+            var cam = FlightCamera.fetch;
+            if (cam != null)
+                cam.setModeImmediate(FlightCamera.Modes.AUTO);
+        }
 
         // Start holding the UI hidden before the switch so no stage of the
         // vessel transition can sneak the HUD back in.
@@ -1355,6 +1375,7 @@ public partial class FastVesselChanger : MonoBehaviour
             _lastShowHullcamSection = _showHullcamSection;
             _writeLMPPlayersLog = ParseBool(root["WriteLMPPlayersLog"]?.InnerText, false);
             _writeVesselLog = ParseBool(root["WriteVesselLog"]?.InnerText, false);
+            _writeCameraLog = ParseBool(root["WriteCameraLog"]?.InnerText, false);
 
             XmlElement filters = root["TypeFilters"];
             if (filters != null)
@@ -1432,6 +1453,10 @@ public partial class FastVesselChanger : MonoBehaviour
             writeVesselLogNode.InnerText = _writeVesselLog.ToString();
             root.AppendChild(writeVesselLogNode);
 
+            XmlElement writeCameraLogNode = doc.CreateElement("WriteCameraLog");
+            writeCameraLogNode.InnerText = _writeCameraLog.ToString();
+            root.AppendChild(writeCameraLogNode);
+
             doc.Save(prefsPath);
         }
         catch (Exception e)
@@ -1476,15 +1501,19 @@ public partial class FastVesselChanger : MonoBehaviour
         {
             // Snapshot current vessel's zoom before serializing so it isn't lost
             // when saving without having switched away from it first.
-            var activeVessel = FlightGlobals.ActiveVessel;
-            if (activeVessel != null)
+            // Use _instanceVesselId (pinned at Start) instead of FlightGlobals.ActiveVessel:
+            // after SetActiveVessel, ActiveVessel points to the NEW vessel while the camera
+            // still reflects the OLD vessel — writing cam.Distance against the new ID would
+            // corrupt its zoom entry.  _instanceVesselId is always the vessel this instance
+            // was created for.
+            if (_instanceVesselId != Guid.Empty)
             {
                 var cam = FlightCamera.fetch;
                 // Only snapshot zoom when the stock FlightCamera is in control.
                 // If a hull cam is active, cam.Distance reflects the hull cam mount
                 // position, not the orbit view distance — don't overwrite the saved value.
                 if (cam != null && _hullcamLastActivatedModule == null)
-                    _vesselZooms[activeVessel.id] = cam.Distance;
+                    _vesselZooms[_instanceVesselId] = cam.Distance;
             }
 
             var scen = FastVesselChangerScenario.Instance;
@@ -1810,29 +1839,43 @@ public partial class FastVesselChanger : MonoBehaviour
             return;
         }
 
-        // Sync hull cam state. No need to call DeactivateCurrentHullCam() here — the scene
-        // teardown destroys all PartModules so HullcamVDS resets itself. Deactivating from
-        // OnDestroy would interfere with native hullcam keys if we never activated anything.
+        // Sync hull cam state and persist BEFORE deactivating the hull cam.
+        // SaveToScenario's zoom snapshot is guarded by _hullcamLastActivatedModule,
+        // so keeping it non-null here prevents overwriting the saved zoom with a
+        // stale cam.Distance value from the hull cam mount.
         if (_hullcamInstalled)
-        {
             SyncCurrentHullcamStateToDict();
-            if (_hullcamLastActivatedModule != null)
-                DeactivateCurrentHullCam();
-        }
 
         SaveToScenario(); // Save state before destroying
+
+        // Deactivate hull cam AFTER save so the zoom guard works, but before the
+        // addon is fully destroyed.  This is a safety net for non-FVC vessel
+        // switches (vessel destruction, LMP sync, etc.).  For FVC-initiated
+        // switches, SwitchToVessel already deactivated before SetActiveVessel,
+        // so _hullcamLastActivatedModule will be null and this is a no-op.
+        if (_hullcamInstalled && _hullcamLastActivatedModule != null)
+            DeactivateCurrentHullCam();
         SaveUserPrefs();
 
         // Restore stock pitch limits before leaving flight scene
         RestorePitchLimits();
 
-        // Ensure UI is visible when leaving flight scene so player isn't stuck with hidden UI
-        try
+        // Ensure UI is visible when truly leaving the flight scene (KSC, tracking
+        // station, quit) so the player isn't stuck with a hidden HUD.  During a
+        // FLIGHT→FLIGHT vessel switch the next scene is still FLIGHT and the new
+        // FVC instance will re-apply the hidden state in Start().  Calling ShowUI
+        // in that case causes a visible flicker — the UI pops in for several
+        // frames until the new instance hides it again.
+        bool leavingFlight = HighLogic.LoadedScene != GameScenes.FLIGHT;
+        if (leavingFlight || userPreferredUIVisible)
         {
-            InvokeShowUI();
-            Debug.Log("[FastVesselChanger] Showing UI when leaving flight scene");
+            try
+            {
+                InvokeShowUI();
+                Debug.Log("[FastVesselChanger] Showing UI when leaving flight scene");
+            }
+            catch { }
         }
-        catch { }
         
         RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
     }
@@ -1879,12 +1922,19 @@ public partial class FastVesselChanger : MonoBehaviour
                         vesselLine + Environment.NewLine + statusLine);
                 }
 
+                // --- CURRENT_CAMERA.txt ---
+                if (_writeCameraLog)
+                {
+                    WriteCameraLogFile(dir);
+                }
+
                 if (!_twitchWriterStartupLogged)
                 {
                     _twitchWriterStartupLogged = true;
                     VerboseLog("[FastVesselChanger] Twitch overlay writer active. LunaEnabled=" + FVCLunaHelper.IsLunaEnabled
                         + ", playersLog=" + _writeLMPPlayersLog
-                        + ", vesselLog=" + _writeVesselLog);
+                        + ", vesselLog=" + _writeVesselLog
+                        + ", cameraLog=" + _writeCameraLog);
                 }
             }
             catch (Exception e)
@@ -1894,6 +1944,53 @@ public partial class FastVesselChanger : MonoBehaviour
 
             yield return new WaitForSeconds(TWITCH_WRITE_INTERVAL);
         }
+    }
+
+    /// <summary>
+    /// Writes the current camera name to CURRENT_CAMERA.txt.
+    /// Called from the periodic coroutine and immediately on camera switches.
+    /// </summary>
+    void WriteCameraLogFile(string dir = null)
+    {
+        if (!_writeCameraLog) return;
+        try
+        {
+            if (dir == null)
+            {
+                dir = Path.GetDirectoryName(GetUserPrefsPath());
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+            }
+            string cameraPath = Path.Combine(dir, TWITCH_CAMERA_FILE);
+            File.WriteAllText(cameraPath, GetCurrentCameraName());
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] WriteCameraLogFile error: " + e.Message);
+        }
+    }
+
+    /// <summary>
+    /// Returns a human-readable name for the current camera view.
+    /// Hull cam name (e.g. "KerbPro", "NavCam") when a hull cam is active,
+    /// or the FlightCamera mode name (e.g. "Auto", "Free", "Orbital", "Chase") otherwise.
+    /// </summary>
+    string GetCurrentCameraName()
+    {
+        // If we activated a hull cam, report its name
+        if (_hullcamLastActivatedModule != null && _hullcamCameraNameField != null)
+        {
+            var name = _hullcamCameraNameField.GetValue(_hullcamLastActivatedModule) as string;
+            if (!string.IsNullOrEmpty(name))
+                return name;
+        }
+
+        // Fall back to the stock FlightCamera mode
+        var cam = FlightCamera.fetch;
+        if (cam != null)
+            return cam.mode.ToString();
+
+        return "Unknown";
     }
 
     /// <summary>

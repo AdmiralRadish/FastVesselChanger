@@ -2,6 +2,7 @@
 <FastVesselChangerUserPrefs>
   <ShowCameraControls>False</ShowCameraControls>
   <ShowTypeFilter>False</ShowTypeFilter>
+  <ShowHullcamSection>True</ShowHullcamSection>
   <TypeFilters>
     <Filter name="Ship" />
     <Filter name="Station" />
@@ -14,4 +15,5 @@
   <Window x="20" y="80" width="400" height="500" />
   <WriteLMPPlayersLog>False</WriteLMPPlayersLog>
   <WriteVesselLog>False</WriteVesselLog>
+  <WriteCameraLog>False</WriteCameraLog>
 </FastVesselChangerUserPrefs>
