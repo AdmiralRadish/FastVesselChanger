@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FastVesselChangerUserPrefs>
-  <ShowCameraControls>False</ShowCameraControls>
+  <ShowCameraControls>True</ShowCameraControls>
   <ShowTypeFilter>False</ShowTypeFilter>
   <ShowHullcamSection>True</ShowHullcamSection>
   <TypeFilters>

@@ -341,19 +341,19 @@ public partial class FastVesselChanger : MonoBehaviour
     }
 
     // Calls UIMasterController.HideUI() — this is what KSP's F2 handler uses internally.
-    // We ALSO always fire onHideUI directly because vessel transitions can call
-    // GameEvents.onShowUI.Fire() directly (bypassing UIMasterController), which re-shows
-    // UI elements without changing UIMasterController.showUI. In that state HideUI() may
-    // return early due to an internal "already hidden" guard, so the direct event is needed
-    // to reach the individual UI elements regardless.
+    // UIMasterController.HideUI() fires GameEvents.onHideUI internally, so we must NOT
+    // also fire the event — double-firing causes ManeuverTool's AppUIInputPanel.RefreshUI()
+    // to process twice per call, amplifying a stock KSP NullRef bug.
+    // We only fire the event directly as a fallback when UIMasterController is unavailable.
     void InvokeHideUI()
     {
         var inst = GetUIMasterInstance();
         if (inst != null && _uiHideMethod != null)
         {
-            try { _uiHideMethod.Invoke(inst, null); }
+            try { _uiHideMethod.Invoke(inst, null); return; }
             catch (Exception e) { Debug.LogWarning("[FastVesselChanger] UIMasterController.HideUI() failed: " + e.Message); }
         }
+        // Fallback: fire the event directly when UIMasterController is not available
         GameEvents.onHideUI.Fire();
     }
 
@@ -363,15 +363,8 @@ public partial class FastVesselChanger : MonoBehaviour
         var inst = GetUIMasterInstance();
         if (inst != null && _uiShowMethod != null)
         {
-            try
-            {
-                _uiShowMethod.Invoke(inst, null);
-                return;
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[FastVesselChanger] UIMasterController.ShowUI() failed: " + e.Message);
-            }
+            try { _uiShowMethod.Invoke(inst, null); return; }
+            catch (Exception e) { Debug.LogWarning("[FastVesselChanger] UIMasterController.ShowUI() failed: " + e.Message); }
         }
         GameEvents.onShowUI.Fire();
     }
@@ -404,18 +397,18 @@ public partial class FastVesselChanger : MonoBehaviour
 
     IEnumerator HoldUIHidden()
     {
+        // Now that UIMasterController.HideUI() is properly resolved, one call is enough
+        // to hide the HUD — KSP's state machine remembers the hidden state. We just need
+        // periodic re-checks to catch any KSP code that re-shows the UI during load.
+        // 10 Hz is sufficient; every-frame was causing ManeuverTool crash amplification.
         float deadline = Time.time + 6f; // cover full vessel load pipeline
-        float everyFrameUntil = Time.time + 2f; // every frame for first 2s (critical window)
         while (Time.time < deadline)
         {
             if (!userPreferredUIVisible)
                 InvokeHideUI();
             else
                 yield break; // user chose to show — stop fighting it
-            if (Time.time < everyFrameUntil)
-                yield return null; // every frame during vessel-load to prevent any flash
-            else
-                yield return _uiHoldWait; // 10 Hz for the remaining hold period
+            yield return _uiHoldWait; // 10 Hz
         }
         _uiHoldCoroutine = null;
     }

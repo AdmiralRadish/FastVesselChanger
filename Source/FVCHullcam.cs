@@ -230,6 +230,16 @@ public partial class FastVesselChanger
         }
         try
         {
+            // Snapshot the current external-camera zoom BEFORE hull cam takes over, so
+            // RestoreZoomAfterHullcamDeactivate() has the correct value to restore.
+            // Only capture when transitioning from external → hull cam (not cam → cam).
+            if (_hullcamLastActivatedModule == null && _instanceVesselId != Guid.Empty)
+            {
+                var fc = FlightCamera.fetch;
+                if (fc != null)
+                    _vesselZooms[_instanceVesselId] = fc.Distance;
+            }
+
             var camName = _hullcamCameraNameField != null ? (_hullcamCameraNameField.GetValue(module) as string ?? "?") : "?";
             Debug.Log("[FastVesselChanger] ActivateHullCam: invoking ActivateCamera on '" + camName + "'");
             _hullcamActivateMethod.Invoke(module, null);
