@@ -48,7 +48,7 @@ public partial class FastVesselChanger
     private float _hullcamLastSwitchRealtime = 0f;
     private Vector2 _hullcamScrollPos = Vector2.zero;
     private bool _lastHullcamSectionVisible = true;  // init true so first DrawHullcamSection call always triggers a resize
-    private bool _showHullcamSection = true;   // whether the section is expanded (user pref)
+    private bool _showHullcamSection = false;   // whether the section is expanded (user pref, hidden by default)
     private bool _lastShowHullcamSection = true;
     // Tracks which module WE last activated; only this module is ever deactivated by our code.
     // Null means we have not activated any hull cam in this instance's lifetime.
@@ -489,6 +489,10 @@ public partial class FastVesselChanger
             DeactivateCurrentHullCam();  // external cam slot — no-op if nothing active
         else
             ActivateHullCam(firstMod);
+
+        // Clear the blackout overlay now that the hull cam (or external fallback)
+        // is rendering — the stock FlightCamera flash is no longer visible.
+        _pendingHullcamBlackout = false;
     }
 
     void LoadHullcamSettingsFromScenario(FastVesselChangerScenario scen)
