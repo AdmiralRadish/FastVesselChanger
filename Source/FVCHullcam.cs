@@ -37,8 +37,9 @@ public partial class FastVesselChanger
     private Guid _cachedVesselCamsId = Guid.Empty;
 
     // Hull cam state for the active vessel (instance — reset on each addon recreation)
+    private const float HULLCAM_MIN_INTERVAL = 10f;
     private bool _hullcamAutoActive = false;
-    private float _hullcamInterval = 10f;
+    private float _hullcamInterval = HULLCAM_MIN_INTERVAL;
     private string _hullcamIntervalText = "10";
     private bool _hullcamIncludeExternal = true;
     private HashSet<uint> _hullcamSelectedIds = new HashSet<uint>();
@@ -223,6 +224,16 @@ public partial class FastVesselChanger
             Debug.LogWarning("[FastVesselChanger] ActivateHullCam: module is null, skipping");
             return;
         }
+        // Guard: refuse activation if the flight scene isn't fully ready or if a
+        // scene transition is in progress.  Activating a hull cam during scene
+        // teardown corrupts HullcamVDS's static sCurrentCamera reference, causing
+        // the destination scene to freeze.
+        if (!_switchWatchdogFlightReady || HighLogic.LoadedScene != GameScenes.FLIGHT)
+        {
+            Debug.LogWarning("[FastVesselChanger] ActivateHullCam: scene not ready (flightReady="
+                + _switchWatchdogFlightReady + " scene=" + HighLogic.LoadedScene + "), skipping");
+            return;
+        }
         if (_hullcamActivateMethod == null)
         {
             Debug.LogWarning("[FastVesselChanger] ActivateHullCam: _hullcamActivateMethod is null — type resolution failed?");
@@ -240,25 +251,44 @@ public partial class FastVesselChanger
                     _vesselZooms[_instanceVesselId] = fc.Distance;
             }
 
+            // Guard against stale camActive state — HullcamVDS's ActivateCamera() is a
+            // toggle: if camActive is already true it DEACTIVATES instead of activating.
+            // This happens when cycling lands on a camera that was never explicitly deactivated
+            // (e.g. LeaveCamera() was called but didn't clear the per-module camActive flag,
+            //  or the cycling timer re-visits the already-active camera after a rotation rebuild).
+            if (_hullcamIsActiveField != null)
+            {
+                try
+                {
+                    bool alreadyActive = (bool)(_hullcamIsActiveField.GetValue(module) ?? false);
+                    if (alreadyActive)
+                    {
+                        if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] ActivateHullCam: camActive was already true on target module — resetting to false before activation");
+                        _hullcamIsActiveField.SetValue(module, false);
+                    }
+                }
+                catch (Exception ex) { Debug.LogWarning("[FastVesselChanger] ActivateHullCam: failed to check/reset camActive: " + ex.Message); }
+            }
+
             var camName = _hullcamCameraNameField != null ? (_hullcamCameraNameField.GetValue(module) as string ?? "?") : "?";
-            Debug.Log("[FastVesselChanger] ActivateHullCam: invoking ActivateCamera on '" + camName + "'");
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] ActivateHullCam: invoking ActivateCamera on '" + camName + "'");
             _hullcamActivateMethod.Invoke(module, null);
             _hullcamLastActivatedModule = module;
-            Debug.Log("[FastVesselChanger] ActivateHullCam: success");
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] ActivateHullCam: success");
 
             // Update camera log file immediately
             WriteCameraLogFile();
 
             // Cancel any pending zoom restore — FlightCamera.fetch will be null while a
-            // hull cam owns the camera, so the zoom restore loop in Update() would spin
-            // uselessly (and in older builds, flood the log every frame causing a hang).
-            // Zoom is handled separately by RestoreZoomAfterHullcamDeactivate() on deactivation.
+            // hull cam owns the camera, so the zoom restore in the end-of-frame coroutine
+            // would be unable to apply it.  Zoom is handled separately by
+            // RestoreZoomAfterHullcamDeactivate() on deactivation.
             if (_pendingZoomRestore)
             {
-                Debug.Log("[FastVesselChanger] ActivateHullCam: cancelling pending zoom restore (hull cam now owns camera)");
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] ActivateHullCam: cancelling pending zoom restore (hull cam now owns camera)");
                 _pendingZoomRestore = false;
                 _pendingZoomVesselId = Guid.Empty;
-                _pendingZoomDeadlineRealtime = 0f;
+                _pendingZoomFramesRemaining = 0;
             }
         }
         catch (Exception e) { Debug.LogWarning("[FastVesselChanger] HullCam ActivateCamera failed: " + e.GetType().Name + ": " + e.Message); }
@@ -269,17 +299,17 @@ public partial class FastVesselChanger
         // Only deactivate a module that WE activated. Never blindly deactivate native hullcam state.
         if (_hullcamLastActivatedModule == null)
         {
-            Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: nothing to deactivate (_hullcamLastActivatedModule is null)");
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: nothing to deactivate (_hullcamLastActivatedModule is null)");
             return;
         }
-        Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: deactivating...");
+        if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: deactivating...");
         try
         {
             if (_hullcamDeactivateMethod != null)
             {
                 // LeaveCamera() is a static method — invoke with null instance.
                 // It calls RestoreMainCamera() which resets the FlightCamera back to normal.
-                Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: calling LeaveCamera() (static)");
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: calling LeaveCamera() (static)");
                 _hullcamDeactivateMethod.Invoke(null, null);
             }
             else if (_hullcamActivateMethod != null)
@@ -290,7 +320,7 @@ public partial class FastVesselChanger
                 bool isActive = false;
                 if (_hullcamIsActiveField != null)
                     isActive = (bool)(_hullcamIsActiveField.GetValue(_hullcamLastActivatedModule) ?? false);
-                Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: LeaveCamera unavailable; camActive=" + isActive + " — " + (isActive ? "calling ActivateCamera toggle" : "skipping (not active)"));
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] DeactivateCurrentHullCam: LeaveCamera unavailable; camActive=" + isActive + " — " + (isActive ? "calling ActivateCamera toggle" : "skipping (not active)"));
                 if (isActive)
                     _hullcamActivateMethod.Invoke(_hullcamLastActivatedModule, null);
             }
@@ -300,6 +330,16 @@ public partial class FastVesselChanger
             }
         }
         catch (Exception e) { Debug.LogWarning("[FastVesselChanger] HullCam deactivate failed: " + e.GetType().Name + ": " + e.Message); }
+
+        // Clear camActive on the module we just deactivated.  LeaveCamera() (static) may
+        // not always reset the per-module flag, leaving it stale at true.  If the cycling
+        // timer later re-visits this module, ActivateCamera() would toggle OFF instead of ON.
+        if (_hullcamIsActiveField != null && _hullcamLastActivatedModule != null)
+        {
+            try { _hullcamIsActiveField.SetValue(_hullcamLastActivatedModule, false); }
+            catch { }
+        }
+
         _hullcamLastActivatedModule = null;
 
         // Update camera log file immediately (now showing FlightCamera mode)
@@ -347,13 +387,7 @@ public partial class FastVesselChanger
         cam.SetDistanceImmediate(savedZoom);
         _camDistField?.SetValue(cam, savedZoom);
 
-        // Use the lockout mechanism to enforce the value for a short window, the same
-        // way the vessel-switch zoom restore does — LeaveCamera() can trigger camera
-        // movement that would otherwise overwrite our applied value.
-        _zoomLockoutVesselId = _instanceVesselId;
-        _zoomLockoutTarget = savedZoom;
-        _zoomLockoutUntilRealtime = Time.realtimeSinceStartup + ZOOM_LOCKOUT_SECONDS;
-        Debug.Log("[FastVesselChanger] RestoreZoomAfterHullcamDeactivate: zoom=" + savedZoom);
+        if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] RestoreZoomAfterHullcamDeactivate: zoom=" + savedZoom);
     }
 
     void CycleToNextHullCam()
@@ -363,16 +397,20 @@ public partial class FastVesselChanger
         var mod = _hullcamRotation[_hullcamRotationIndex];
         if (mod == null)
         {
-            // Only restore zoom if we were actually coming from an active hull cam;
-            // if no hull cam was active there is nothing to restore and we must NOT
-            // start a lockout (which would block the scroll wheel for 2 seconds).
-            bool wasHullCamActive = _hullcamLastActivatedModule != null;
-            DeactivateCurrentHullCam();
-            if (wasHullCamActive) RestoreZoomAfterHullcamDeactivate();
+            // External camera slot — only deactivate if a hull cam is currently active.
+            if (_hullcamLastActivatedModule != null)
+            {
+                DeactivateCurrentHullCam();
+                RestoreZoomAfterHullcamDeactivate();
+            }
+            // else: already in external view, nothing to do
         }
         else
         {
-            ActivateHullCam(mod);
+            // Hull camera slot — skip if this camera is already active (prevents
+            // pointless re-activation and the ActivateCamera toggle confusion).
+            if (mod != _hullcamLastActivatedModule)
+                ActivateHullCam(mod);
         }
     }
 
@@ -395,7 +433,7 @@ public partial class FastVesselChanger
         s.hullcamInterval    = _hullcamInterval;
         s.includeExternal    = _hullcamIncludeExternal;
         s.selectedFlightIds  = new HashSet<uint>(_hullcamSelectedIds);
-        Debug.Log("[FastVesselChanger] SyncCurrentHullcamStateToDict: vesselId=" + _instanceVesselId
+        if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] SyncCurrentHullcamStateToDict: vesselId=" + _instanceVesselId
             + " hullcamEnabled=" + s.hullcamEnabled
             + " selectedCams=" + s.selectedFlightIds.Count);
     }
@@ -406,27 +444,51 @@ public partial class FastVesselChanger
         // Do NOT call DeactivateCurrentHullCam() here — we have not activated anything yet and
         // blindly deactivating would break native HullcamVDS key controls on the active vessel.
         var s = GetOrCreateHullcamSettings(v.id);
-        Debug.Log("[FastVesselChanger] ApplyVesselHullcamSettings: vessel='" + v.vesselName
+        if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] ApplyVesselHullcamSettings: vessel='" + v.vesselName
             + "' id=" + v.id
             + " hullcamEnabled=" + s.hullcamEnabled
             + " interval=" + s.hullcamInterval
+            + " includeExternal=" + s.includeExternal
             + " selectedCams=" + s.selectedFlightIds.Count
             + " (dictEntries=" + _vesselHullcamSettings.Count + ")");
         _hullcamAutoActive      = s.hullcamEnabled;
-        _hullcamInterval        = Mathf.Max(1f, s.hullcamInterval);
+        _hullcamInterval        = Mathf.Max(HULLCAM_MIN_INTERVAL, s.hullcamInterval);
         _hullcamIntervalText    = _hullcamInterval.ToString("F0");
         _hullcamIncludeExternal = s.includeExternal;
         _hullcamSelectedIds     = new HashSet<uint>(s.selectedFlightIds);
         _hullcamLastSwitchRealtime = Time.realtimeSinceStartup;
         _hullcamRotationIndex   = -1;
         RebuildHullCamRotation(v);
-        if (_hullcamAutoActive && _hullcamRotation.Count > 0)
-        {
-            _hullcamRotationIndex = 0;
-            var firstMod = _hullcamRotation[0];
-            if (firstMod == null) DeactivateCurrentHullCam();
-            else                  ActivateHullCam(firstMod);
-        }
+        // Do NOT activate any hull cam here — this runs during Start(), before
+        // onFlightReady.  If the scene is stuck in an NRE cascade (Waterfall etc.),
+        // activating a cam on half-initialized parts would worsen the situation.
+        // Hull cam auto-activation is deferred to ActivateHullcamIfReady(), which is
+        // called from OnFlightReady() once the scene is confirmed healthy.
+    }
+
+    /// <summary>
+    /// Activates the first hull cam in the rotation, if hullcam auto-cycling is enabled.
+    /// Called from OnFlightReady() — only after the scene is fully initialized and healthy.
+    /// This prevents activating cameras on half-loaded vessels during NRE cascades.
+    /// </summary>
+    void ActivateHullcamIfReady()
+    {
+        if (!_hullcamInstalled || !_hullcamAutoActive || _hullcamRotation.Count == 0) return;
+        var v = FlightGlobals.ActiveVessel;
+        if (v == null) return;
+
+        // Rebuild rotation now that parts are fully loaded (Start-time scan may have
+        // seen incomplete part lists)
+        RebuildHullCamRotation(v);
+        if (_hullcamRotation.Count == 0) return;
+
+        _hullcamRotationIndex = 0;
+        _hullcamLastSwitchRealtime = Time.realtimeSinceStartup;
+        var firstMod = _hullcamRotation[0];
+        if (firstMod == null)
+            DeactivateCurrentHullCam();  // external cam slot — no-op if nothing active
+        else
+            ActivateHullCam(firstMod);
     }
 
     void LoadHullcamSettingsFromScenario(FastVesselChangerScenario scen)
@@ -487,12 +549,25 @@ public partial class FastVesselChanger
         // All HullcamVDS exit paths set the static sCurrentCamera to null.  If we
         // had previously activated a hull cam (_hullcamLastActivatedModule != null)
         // but sCurrentCamera is now null, the user left via native keys.
+        //
+        // Skip all hullcam processing if the watchdog is armed and flight isn't ready —
+        // the scene is in an NRE cascade and we must not touch camera state.
+        if (_switchWatchdogRealtime > 0f && !_switchWatchdogFlightReady)
+            return;
+
         if (_hullcamInstalled && _hullcamLastActivatedModule != null && _hullcamCurrentCamField != null)
         {
             object currentCam = _hullcamCurrentCamField.GetValue(null);
             if (currentCam == null)
             {
-                Debug.Log("[FastVesselChanger] UpdateHullcam: native hull cam deactivation detected — restoring zoom");
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] UpdateHullcam: native hull cam deactivation detected — restoring zoom");
+                // Clear camActive on the module that was natively deactivated, in case the
+                // native exit path didn't reset it.  Prevents toggle mis-fire on next activation.
+                if (_hullcamIsActiveField != null)
+                {
+                    try { _hullcamIsActiveField.SetValue(_hullcamLastActivatedModule, false); }
+                    catch { }
+                }
                 _hullcamLastActivatedModule = null;
                 RestoreZoomAfterHullcamDeactivate();
                 WriteCameraLogFile();
@@ -509,7 +584,7 @@ public partial class FastVesselChanger
         // Hull cam auto-cycling — independent of the vessel-switch timer
         if (_hullcamAutoActive && _hullcamInstalled && _hullcamRotation.Count > 0)
         {
-            float hcInterval = Mathf.Max(1f, _hullcamInterval);
+            float hcInterval = Mathf.Max(HULLCAM_MIN_INTERVAL, _hullcamInterval);
             if (Time.realtimeSinceStartup - _hullcamLastSwitchRealtime >= hcInterval)
             {
                 _hullcamLastSwitchRealtime = Time.realtimeSinceStartup;
@@ -534,7 +609,7 @@ public partial class FastVesselChanger
         bool hcVisible = vesselCams.Count > 0;
         if (hcVisible != _lastHullcamSectionVisible)
         {
-            Debug.Log("[FastVesselChanger] DrawHullcamSection: visibility changed to " + hcVisible
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] DrawHullcamSection: visibility changed to " + hcVisible
                 + " (installed=" + _hullcamInstalled + ", cams=" + vesselCams.Count + ", vessel='" + (hcVessel?.vesselName ?? "null") + "')");
             windowRect.height = 0; // force window to resize
             _lastHullcamSectionVisible = hcVisible;
@@ -590,7 +665,7 @@ public partial class FastVesselChanger
         {
             _hullcamIntervalText = newHcText;
             float hcIParsed;
-            if (float.TryParse(_hullcamIntervalText, NumberStyles.Float, CultureInfo.InvariantCulture, out hcIParsed) && hcIParsed >= 1f)
+            if (float.TryParse(_hullcamIntervalText, NumberStyles.Float, CultureInfo.InvariantCulture, out hcIParsed) && hcIParsed >= HULLCAM_MIN_INTERVAL)
             {
                 _hullcamInterval = hcIParsed;
                 SyncCurrentHullcamStateToDict();
@@ -600,11 +675,17 @@ public partial class FastVesselChanger
         GUILayout.Label("s", GUILayout.Width(14));
         GUILayout.EndHorizontal();
 
-        if (_hullcamAutoActive)
+        // Always render the countdown label to keep a stable layout height.
+        // If this row appears/disappears when toggling ON/OFF, the scroll view
+        // controls below shift position and IMGUI can deliver a click to the wrong
+        // control (e.g. unchecking "External Camera" when the user only clicked ON).
         {
-            float hcEffective = Mathf.Max(1f, _hullcamInterval);
+            float hcEffective = Mathf.Max(HULLCAM_MIN_INTERVAL, _hullcamInterval);
             float hcRemaining = Mathf.Max(0f, hcEffective - (Time.realtimeSinceStartup - _hullcamLastSwitchRealtime));
-            GUILayout.Label("Next camera in: " + hcRemaining.ToString("F0") + "s", GUILayout.Width(200));
+            GUILayout.Label(_hullcamAutoActive
+                ? "Next camera in: " + hcRemaining.ToString("F0") + "s"
+                : " ",
+                GUILayout.Width(200));
         }
 
         // Camera pick list (scrollable)
@@ -614,6 +695,7 @@ public partial class FastVesselChanger
         bool newExternal = GUILayout.Toggle(_hullcamIncludeExternal, "  External Camera");
         if (newExternal != _hullcamIncludeExternal)
         {
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] External Camera toggle changed: " + _hullcamIncludeExternal + " → " + newExternal);
             _hullcamIncludeExternal = newExternal;
             RebuildHullCamRotation(hcVessel);
             SyncCurrentHullcamStateToDict();
@@ -629,7 +711,7 @@ public partial class FastVesselChanger
             {
                 if (newCamSel) _hullcamSelectedIds.Add(hce.part.flightID);
                 else           _hullcamSelectedIds.Remove(hce.part.flightID);
-                Debug.Log("[FastVesselChanger] HullCam checkbox: '" + GetHullCamDisplayName(hce.part, hce.module)
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] HullCam checkbox: '" + GetHullCamDisplayName(hce.part, hce.module)
                     + "' flightID=" + hce.part.flightID + " selected=" + newCamSel
                     + " (_hullcamSelectedIds.Count now=" + _hullcamSelectedIds.Count + ")");
                 RebuildHullCamRotation(hcVessel);

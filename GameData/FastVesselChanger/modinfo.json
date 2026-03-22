@@ -4,7 +4,7 @@
   "abstract": "Cycle through selected vessels with timer-based switching and in-flight controls",
   "description": "FastVesselChanger adds a flight window for cycling between selected vessels on a configurable timer, with one-click Next/Refresh controls, vessel-type filtering, and per-vessel selection. It also includes optional camera rotation and zoom tracking, plus per-player saved settings when LunaMultiplayer is present.",
   "author": "AdmiralRadish",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "ksp_version_min": "1.8",
   "ksp_version_max": "1.12",
   "license": "MIT",
