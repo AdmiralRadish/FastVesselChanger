@@ -33,15 +33,18 @@ public partial class FastVesselChanger : MonoBehaviour
     private bool showWindow = true;
     private bool showTypeFilter = false; // Toggle for vessel type filter section
     private bool lastShowTypeFilter = false; // Track previous state to detect changes
-    private bool _loadedTypeFiltersFromUserPrefs = false;
-    private bool showCameraControls = false; // Toggle for camera controls section
+    private bool showCameraControls = true; // Toggle for camera controls section
     private bool lastShowCameraControls = false; // Track previous state to detect changes
+    private bool _lastShowPresets = false; // Track preset section state for height recalc
     private string vesselSearchText = ""; // Live search filter for vessel list
+
+    // Lazy-initialized GUIStyle for current vessel label (bold + slightly larger)
+    private GUIStyle _currentVesselStyle = null;
 
     private Dictionary<Guid, bool> selected = new Dictionary<Guid, bool>();
     private Dictionary<string, bool> vesselTypeFilter = new Dictionary<string, bool>(); // Vessel type filtering
-    private int switchInterval = 300; // default to 5 minutes
-    private string switchIntervalText = "300"; // Text buffer for the input field to avoid getting stuck
+    private int switchInterval = 240; // default to 4 minutes
+    private string switchIntervalText = "240"; // Text buffer for the input field to avoid getting stuck
     private int pendingInterval = -1; // interval typed by user but deferred (would fire immediately)
     private bool autoEnabled = false; // default to disabled
     private double lastSwitchTime = 0.0; // universal time of last switch (any switch)
@@ -49,6 +52,7 @@ public partial class FastVesselChanger : MonoBehaviour
 
     // Flight UI state tracking
     private bool userPreferredUIVisible = true; // Kept in sync with KSP's onShowUI/onHideUI events (F2)
+    private static bool _staticUserPreferredUIVisible = true; // Survives FLIGHT→FLIGHT scene reloads
 
     // Camera auto-rotation
     private bool cameraRotEnabled = false;
@@ -76,20 +80,38 @@ public partial class FastVesselChanger : MonoBehaviour
     private static float _pendingRandomX = 0f;
     private static float _pendingRandomY = 0f;
 
+    // Shuffle bag IDs loaded from XML, resolved against cycleList in RestoreShuffleBag
+    private static List<string> _loadedShuffleBagIds = new List<string>();
+
+    // Per-vessel auto-switch intervals — keyed by vessel ID, survives vessel switches within a session
+    private static Dictionary<Guid, int> _vesselSwitchIntervals = new Dictionary<Guid, int>();
+
     // Per-vessel zoom levels — keyed by vessel ID, survives vessel switches within a session
     private static Dictionary<Guid, float> _vesselZooms = new Dictionary<Guid, float>();
-    // Pending zoom — applied every frame in Update() until the target vessel is active or timeout
+    // Pending zoom — applied every end-of-frame for multiple frames to override deferred
+    // FlightCamera.SetTarget() calls that fire after onFlightReady.
     private static Guid _pendingZoomVesselId = Guid.Empty;
     private static float _pendingZoom = 0f;
     private static bool _pendingZoomRestore = false;
-    private static bool _pendingZoomLoggedFirstFrame = false;
-    private static float _pendingZoomDeadlineRealtime = 0f;
-    private static Guid _zoomLockoutVesselId = Guid.Empty;
-    private static float _zoomLockoutTarget = 0f;
-    private static float _zoomLockoutUntilRealtime = 0f;
+    private static int _pendingZoomFramesRemaining = 0;
+    private const int ZOOM_RESTORE_FRAMES = 90; // ~1.5s at 60fps
     private static FieldInfo _camDistField = null;  // cached reflection handle for FlightCamera.distance
     private static bool _camDistFieldSearched = false; // true once we've attempted the lookup
-    private const float ZOOM_LOCKOUT_SECONDS = 1.0f;
+
+    // Hullcam blackout: draws a full-screen black overlay between scene start and
+    // hullcam activation to hide the stock FlightCamera flash on vessels that have
+    // hull cam auto-cycling enabled.
+    private static bool _pendingHullcamBlackout = false;
+    private static float _hullcamBlackoutDeadline = 0f; // safety timeout (realtime)
+    private static Texture2D _blackTex = null;
+
+    // Post-switch health monitor: logs when a vessel switch was initiated
+    // but the game never reached a healthy state.  Informational only — does
+    // NOT take recovery actions (no LoadScene, no force-quit).
+    private static float _switchWatchdogRealtime = 0f;
+    private static Guid _switchWatchdogTargetId = Guid.Empty;
+    private static bool _switchWatchdogFlightReady = true; // true once GameEvents.onFlightReady fires after a switch
+    private const float SWITCH_WATCHDOG_TIMEOUT = 30f;
 
     // Cached reflection handles for UIMasterController (the class that actually hides/shows KSP's HUD).
     // _uiMasterInstance is resolved lazily on first use because UIMasterController.Instance is not
@@ -98,7 +120,10 @@ public partial class FastVesselChanger : MonoBehaviour
     private object _uiMasterInstance = null;
     private MethodInfo _uiHideMethod = null;
     private MethodInfo _uiShowMethod = null;
-    private Coroutine _uiHoldCoroutine = null;
+    private FieldInfo _uiQuickHideField = null;  // KSP's internal F2 toggle field (found via enumeration)
+    // Guard: prevents onShowUI/onHideUI callbacks from double-flipping
+    // userPreferredUIVisible when our button/F2 handler calls InvokeHideUI/ShowUI.
+    private bool _uiToggleGuard = false;
 
     private List<Vessel> cycleList = new List<Vessel>();      // full selected vessel list
     private List<Vessel> shuffleRemaining = new List<Vessel>(); // vessels not yet visited this round
@@ -119,6 +144,9 @@ public partial class FastVesselChanger : MonoBehaviour
     private bool _writeVesselLog = false;      // persist to XML user prefs
     private bool _writeCameraLog = false;       // persist to XML user prefs
     private static readonly bool VERBOSE_DIAGNOSTICS = false;
+    private static float _sceneLoadGraceRealtime = 0f; // block phantom GUI clicks for 2s after onFlightReady
+    private static float _uiHideDeadlineRealtime = 0f;  // realtime deadline for per-frame hide re-assertions
+    private const float UI_HIDE_DURATION = 5f; // seconds of aggressive re-hiding after scene load
     private const string TWITCH_PLAYERS_FILE = "players_online.txt";
     private const string TWITCH_VESSEL_FILE = "current_vessel.txt";
     private const string TWITCH_CAMERA_FILE = "CURRENT_CAMERA.txt";
@@ -126,6 +154,14 @@ public partial class FastVesselChanger : MonoBehaviour
 
     // Guard against multiple switches in the same frame
     private int lastFrameCount = -1;
+
+    // Flight-ready gate: Update(), OnGUI(), and coroutines are passive until this is true.
+    // Set by OnFlightReady() once the flight scene is fully initialized.
+    private bool _flightReady = false;
+
+    // Diagnostic heartbeat — logs periodically so we can tell if the main thread is alive
+    private float _lastHeartbeatRealtime = 0f;
+    private const float HEARTBEAT_INTERVAL = 5f;
 
     // Cached sorted vessel list for OnGUI — rebuilt only when vessel count changes
     private List<Vessel> _cachedSortedVessels = new List<Vessel>();
@@ -135,14 +171,48 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void Awake()
     {
-        if (_activeInstance != null && _activeInstance != this)
+        Debug.Log("[FastVesselChanger] Awake() enter frame=" + Time.frameCount + " t=" + Time.realtimeSinceStartup.ToString("F3"));
+        try
         {
-            Debug.LogWarning("[FastVesselSwitcher] Duplicate Flight addon instance detected; destroying duplicate.");
-            Destroy(this);
-            return;
-        }
+            if (_activeInstance != null && _activeInstance != this)
+            {
+                Debug.LogWarning("[FastVesselChanger] Duplicate Flight addon instance detected; destroying duplicate.");
+                Destroy(this);
+                return;
+            }
 
-        _activeInstance = this;
+            _activeInstance = this;
+
+            // Restore UI preference from static (survives FLIGHT→FLIGHT scene reloads)
+            userPreferredUIVisible = _staticUserPreferredUIVisible;
+
+            // Cache UIMasterController reflection handles early so InvokeHideUI works before Start()
+            try { CacheUIMasterController(); }
+            catch (Exception e) { Debug.LogWarning("[FastVesselChanger] CacheUIMasterController in Awake failed: " + e.Message); }
+
+            // Load just the UIVisible preference from disk.  Critical for Space Center → Flight
+            // transitions where _staticUserPreferredUIVisible is stale (true) but the saved
+            // pref on disk is false.  Must run BEFORE the hide check below.
+            LoadEarlyUIPreference();
+
+            // Hide the HUD immediately in Awake() — before any frames render — to prevent
+            // the visible "flash" that occurs when the UI is briefly shown during scene load.
+            if (!userPreferredUIVisible)
+            {
+                _uiHideDeadlineRealtime = Time.realtimeSinceStartup + UI_HIDE_DURATION;
+                try { InvokeHideUI(); }
+                catch (Exception e) { Debug.LogWarning("[FastVesselChanger] Awake early HideUI failed: " + e.Message); }
+            }
+
+            // ALL event registration deferred to Start() for safety.
+            // GameEvents may not be fully initialised during Awake() in heavily-modded installs.
+
+            Debug.Log("[FastVesselChanger] Awake() complete frame=" + Time.frameCount + " t=" + Time.realtimeSinceStartup.ToString("F3"));
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[FastVesselChanger] Awake() FAILED: " + e.GetType().Name + ": " + e.Message + "\n" + e.StackTrace);
+        }
     }
 
     void VerboseLog(string message, bool warning = false)
@@ -156,150 +226,45 @@ public partial class FastVesselChanger : MonoBehaviour
         }
     }
 
+
+
     void Start()
     {
         // Awake() may have called Destroy(this) if a duplicate was detected, but Unity still
         // invokes Start() on the same frame (destruction is deferred to end-of-frame).
-        // Without this guard both this instance and the surviving active instance would each
-        // register their own event subscription and retry coroutine — two independent _appButton
-        // instance fields both null — leading to two AddModApplication calls and two toolbar icons.
         if (_activeInstance != this)
         {
             Debug.LogWarning("[FastVesselSwitcher] Start() called on non-active duplicate instance; aborting.");
             return;
         }
 
-        Debug.Log("[FastVesselChanger] started");
-        
-        // Initialize lastSwitchTime to prevent premature switching on startup
-        lastSwitchTime = Planetarium.GetUniversalTime();
-        
-        // Log multiplayer status
-        if (FVCLunaHelper.IsLunaEnabled)
-        {
-            Debug.Log("[FastVesselChanger] LunaMultiplayer detected - using per-player settings");
-            string playerName = FVCLunaHelper.GetCurrentPlayerName();
-            Debug.Log("[FastVesselChanger] Current player: " + playerName);
-        }
-        else
-        {
-            Debug.Log("[FastVesselChanger] Single-player mode");
-        }
+        Debug.Log("[FastVesselChanger] Start() enter frame=" + Time.frameCount + " t=" + Time.realtimeSinceStartup.ToString("F3"));
 
-        InitializeVesselTypeFilter();
-        RefreshSelectionsFromVessels();
-        LoadUserPrefs();
-        
-        // Load persisted settings if scenario exists
-        try
-        {
-            var scen = FastVesselChangerScenario.Instance;
-            if (scen != null)
-            {
-                switchInterval = scen.switchInterval;
-                switchIntervalText = switchInterval.ToString(); // Sync text buffer with loaded value
-                autoEnabled = scen.autoEnabled;
-                showWindow = scen.showWindow;
-                userPreferredUIVisible = scen.uiVisible;
-                cameraRotEnabled = scen.cameraRotEnabled;
-                cameraRotRandomEnabled = scen.cameraRotRandomEnabled;
-                cameraRotXRate = scen.cameraRotXRate;
-                cameraRotYRate = scen.cameraRotYRate;
-                cameraRotXText = cameraRotXRate.ToString("F1");
-                cameraRotYText = cameraRotYRate.ToString("F1");
-                // Window position and local filter prefs are loaded from the XML user prefs in LoadUserPrefs().
-                selected.Clear();
-                foreach (var id in scen.selectedVesselIds)
-                {
-                    Guid g;
-                    if (Guid.TryParse(id, out g))
-                        selected[g] = true;
-                }
+        // Register ONLY onFlightReady.  ALL other initialization (event handlers, coroutines,
+        // AppLauncher button, assembly scanning, file I/O) is deferred until the flight scene
+        // is fully ready.  This keeps FVC completely passive during the init phase so it cannot
+        // interfere with other mods' startup sequences.
+        try { GameEvents.onFlightReady.Add(OnFlightReady); }
+        catch (Exception e) { Debug.LogError("[FastVesselChanger] Failed to register onFlightReady: " + e.Message); }
 
-                _vesselZooms.Clear();
-                foreach (var entry in scen.vesselZoomEntries)
-                {
-                    if (string.IsNullOrEmpty(entry)) continue;
-                    var parts = entry.Split('|');
-                    if (parts.Length != 2) continue;
+        // Register UI visibility callbacks early so we catch onShowUI events
+        // during the entire scene load, not just after OnFlightReady.
+        try { GameEvents.onShowUI.Add(OnShowUI_Instance); } catch (Exception e) { Debug.LogError("[FastVesselChanger] Failed to register onShowUI in Start: " + e.Message); }
+        try { GameEvents.onHideUI.Add(OnHideUI_Instance); } catch (Exception e) { Debug.LogError("[FastVesselChanger] Failed to register onHideUI in Start: " + e.Message); }
 
-                    Guid vesselId;
-                    float zoom;
-                    if (!Guid.TryParse(parts[0], out vesselId)) continue;
-                    if (!float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out zoom)) continue;
-                    _vesselZooms[vesselId] = zoom;
-                }
-
-                if (!_loadedTypeFiltersFromUserPrefs && scen.selectedVesselTypes.Count > 0)
-                {
-                    ApplyEnabledTypeFilters(scen.selectedVesselTypes);
-                    _loadedTypeFiltersFromUserPrefs = true;
-                    SaveUserPrefs();
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("[FastVesselChanger] Error loading scenario data: " + e.Message);
-        }
-
-        // Rebuild the selected vessel pool every time the flight addon is recreated,
-        // then restore the remaining shuffle bag from scenario storage if present.
-        BuildCycleList(resetShuffleBag: false);
-        RestoreShuffleBagFromScenario(FastVesselChangerScenario.Instance);
-
-        // If a vessel switch produced randomized rates, apply them now — after scenario load,
-        // so they override whatever the scenario restored from the on-disk ConfigNode.
-        if (_pendingRandomRates)
-        {
-            cameraRotXRate = _pendingRandomX;
-            cameraRotYRate = _pendingRandomY;
-            cameraRotXText = cameraRotXRate.ToString("F2");
-            cameraRotYText = cameraRotYRate.ToString("F2");
-            _pendingRandomRates = false;
-            SaveToScenario();
-        }
-
-        // Detect HullcamVDS and restore hull cam state for the active vessel.
-        // DetectHullcamVDS is idempotent (static flag) so it's safe to call on every addon recreation.
-        DetectHullcamVDS();
-        LoadHullcamSettingsFromScenario(FastVesselChangerScenario.Instance);
-        var hullcamActiveVessel = FlightGlobals.ActiveVessel;
-        // Pin the vessel this instance is responsible for. SyncCurrentHullcamStateToDict()
-        // always writes to this ID, NOT FlightGlobals.ActiveVessel (which changes the moment
-        // SetActiveVessel is called, before OnDestroy fires on the old instance).
-        _instanceVesselId = hullcamActiveVessel?.id ?? Guid.Empty;
-        if (hullcamActiveVessel != null && _hullcamInstalled)
-            ApplyVesselHullcamSettings(hullcamActiveVessel);
-
-        // Cache UIMasterController (the class that physically hides/shows KSP's flight HUD)
-        CacheUIMasterController();
-
-        // Reactively suppress any onShowUI KSP fires (vessel switch, vessel load, etc.)
-        // by immediately re-hiding the UI one frame later if our preference is hidden.
-        // This catches every onShowUI regardless of when KSP fires it.
-        GameEvents.onShowUI.Add(OnShowUI);
-        GameEvents.onVesselLoaded.Add(OnVesselLoaded);
-
-        // If the addon was recreated mid-session (scene reload during vessel switch),
-        // re-apply the hidden state immediately so it doesn't flash visible.
+        // Reset UI-hide deadline — extends coverage from Awake's initial set.
+        // LateUpdate() handles the actual per-frame InvokeHideUI.
         if (!userPreferredUIVisible)
-            RestartHoldUIHidden();
+            _uiHideDeadlineRealtime = Time.realtimeSinceStartup + UI_HIDE_DURATION;
 
-        // Stock AppLauncher button — subscribe to the event AND start a retry coroutine,
-        // because the event may have already fired before we subscribed.
-        GameEvents.onGUIApplicationLauncherReady.Add(OnGUIAppLauncherReady);
-        GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnGUIAppLauncherUnreadifying);
-        _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
+        // Reset watchdog timer if still armed from a previous switch
+        if (_switchWatchdogRealtime > 0f && _switchWatchdogTargetId != Guid.Empty)
+        {
+            _switchWatchdogRealtime = Time.realtimeSinceStartup;
+            Debug.Log("[FastVesselChanger] Watchdog still armed — reset timer to scene start");
+        }
 
-        // Apply camera pitch handling at end-of-frame so stock camera clamping runs first,
-        // then we enforce widened limits and optional X auto-rotation without overriding
-        // stock keyboard controls.
-        _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
-        _twitchFileWriterCoroutine = StartCoroutine(TwitchFileWriterCoroutine());
-
-        // Write camera log immediately on vessel load so the file reflects the new camera state
-        WriteCameraLogFile();
+        Debug.Log("[FastVesselChanger] started — Start() complete (waiting for onFlightReady) frame=" + Time.frameCount + " t=" + Time.realtimeSinceStartup.ToString("F3"));
     }
 
     void CacheUIMasterController()
@@ -317,7 +282,37 @@ public partial class FastVesselChanger : MonoBehaviour
                 _uiHideMethod = t.GetMethod("HideUI", BindingFlags.Public | BindingFlags.Instance);
                 _uiShowMethod = t.GetMethod("ShowUI", BindingFlags.Public | BindingFlags.Instance);
 
-                Debug.Log("[FastVesselChanger] UIMasterController type found: HideUI=" + (_uiHideMethod != null) + ", ShowUI=" + (_uiShowMethod != null));
+                // F2 toggles a separate boolean inside UIMasterController that
+                // HideUI/ShowUI do NOT update.  We must find and sync this field
+                // so F2 stays in phase after our button calls HideUI/ShowUI.
+                // Enumerate ALL boolean fields and try known name patterns.
+                var instF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                string[] quickHideNames = {
+                    "isUIShowing",
+                    "quickHide", "uiQuickHideActive", "_quickHideActive",
+                    "quickHideActive", "_quickHide", "bQuickHide",
+                    "isQuickHiding", "UIQuickHide", "_uiQuickHide",
+                    "uiHidden", "_uiHidden"
+                };
+                foreach (var name in quickHideNames)
+                {
+                    _uiQuickHideField = t.GetField(name, instF);
+                    if (_uiQuickHideField != null) break;
+                }
+                // Log all bool fields so we can identify the correct one if
+                // none of the known names matched.
+                var allBoolFields = t.GetFields(instF);
+                var boolFieldNames = new System.Text.StringBuilder();
+                foreach (var f in allBoolFields)
+                {
+                    if (f.FieldType == typeof(bool))
+                        boolFieldNames.Append(f.Name).Append(", ");
+                }
+                Debug.Log("[FastVesselChanger] UIMasterController type found:"
+                    + " HideUI=" + (_uiHideMethod != null)
+                    + ", ShowUI=" + (_uiShowMethod != null)
+                    + ", quickHideField=" + (_uiQuickHideField?.Name ?? "NOT FOUND")
+                    + ", allBoolFields=[" + boolFieldNames.ToString().TrimEnd(',', ' ') + "]");
                 break;
             }
             if (_uiInstanceProp == null)
@@ -369,63 +364,238 @@ public partial class FastVesselChanger : MonoBehaviour
         GameEvents.onShowUI.Fire();
     }
 
-    void OnShowUI()
+    // Per-instance onShowUI handler — registered in Start(), removed in OnDestroy.
+    void OnShowUI_Instance()
     {
-        // KSP fires this at unpredictable times during vessel switches/loads.
-        // RestartHoldUIHidden calls InvokeHideUI() synchronously on its first coroutine tick
-        // (before the first yield), so there is zero frame delay — no visible flash.
-        if (!userPreferredUIVisible)
-            RestartHoldUIHidden();
+        if (!HighLogic.LoadedSceneIsFlight)
+            return;
+
+        // Guard: skip if our own button/F2 handler triggered this event.
+        // The handler updates userPreferredUIVisible directly.
+        if (_uiToggleGuard)
+            return;
+
+        // During aggressive scene-load re-hide, suppress KSP's deferred UI init.
+        // Don't update userPreferredUIVisible — keep the user's "hidden" preference.
+        if (!userPreferredUIVisible && Time.realtimeSinceStartup < _uiHideDeadlineRealtime)
+        {
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] onShowUI fired during re-hide window — suppressing");
+            InvokeHideUI();
+            return;
+        }
+
+        userPreferredUIVisible = true;
+        _staticUserPreferredUIVisible = true;
+    }
+
+    // Per-instance onHideUI handler.
+    void OnHideUI_Instance()
+    {
+        if (!HighLogic.LoadedSceneIsFlight)
+            return;
+
+        // Guard: skip if our own button/F2 handler triggered this event.
+        if (_uiToggleGuard)
+            return;
+
+        userPreferredUIVisible = false;
+        _staticUserPreferredUIVisible = false;
     }
 
     void OnVesselLoaded(Vessel _)
     {
         if (!userPreferredUIVisible)
-            RestartHoldUIHidden();
+            InvokeHideUI();
     }
 
-    // Starts (or restarts) a coroutine that continuously re-asserts the hidden state for several
-    // seconds, covering every stage of the vessel-switch/load pipeline that might re-show the UI.
-    void RestartHoldUIHidden()
+    void OnFlightReady()
     {
-        if (_uiHoldCoroutine != null)
-            StopCoroutine(_uiHoldCoroutine);
-        _uiHoldCoroutine = StartCoroutine(HoldUIHidden());
-    }
-
-    private static readonly WaitForSeconds _uiHoldWait = new WaitForSeconds(0.1f);
-
-    IEnumerator HoldUIHidden()
-    {
-        // Now that UIMasterController.HideUI() is properly resolved, one call is enough
-        // to hide the HUD — KSP's state machine remembers the hidden state. We just need
-        // periodic re-checks to catch any KSP code that re-shows the UI during load.
-        // 10 Hz is sufficient; every-frame was causing ManeuverTool crash amplification.
-        float deadline = Time.time + 6f; // cover full vessel load pipeline
-        while (Time.time < deadline)
+        Debug.Log("[FastVesselChanger] onFlightReady ENTER — beginning deferred init");
+        try
         {
-            if (!userPreferredUIVisible)
-                InvokeHideUI();
+            _flightReady = true;
+            _switchWatchdogFlightReady = true;
+
+            // --- Everything below was deferred from Start() to keep FVC completely ---
+            // --- passive during the init phase.                                    ---
+
+            // Step 1: Register event handlers
+            // onShowUI/onHideUI are registered earlier in Start() for full scene-load coverage.
+            Debug.Log("[FastVesselChanger] onFlightReady step 1: event handlers");
+            try { GameEvents.onVesselLoaded.Add(OnVesselLoaded); } catch (Exception e) { Debug.LogError("[FastVesselChanger] Failed to register onVesselLoaded: " + e.Message); }
+
+            // Step 2: Initialize timing and multiplayer
+            Debug.Log("[FastVesselChanger] onFlightReady step 2: timing + multiplayer");
+            lastSwitchTime = Planetarium.GetUniversalTime();
+            if (FVCLunaHelper.IsLunaEnabled)
+            {
+                string playerName = FVCLunaHelper.GetCurrentPlayerName();
+                Debug.Log("[FastVesselChanger] LunaMultiplayer player: " + playerName);
+            }
             else
-                yield break; // user chose to show — stop fighting it
-            yield return _uiHoldWait; // 10 Hz
+            {
+                Debug.Log("[FastVesselChanger] Single-player mode");
+            }
+
+            // Step 3: Filter, vessel, and user prefs init
+            Debug.Log("[FastVesselChanger] onFlightReady step 3: filters + prefs");
+            InitializeVesselTypeFilter();
+            RefreshSelectionsFromVessels();
+            LoadUserPrefs();
+
+            // Step 4: (removed — LoadUserPrefs in step 3 now loads all per-player simulation state)
+            Debug.Log("[FastVesselChanger] onFlightReady step 4: (no-op, data loaded in step 3)");
+
+            // Step 5: Cycle list + shuffle bag
+            Debug.Log("[FastVesselChanger] onFlightReady step 5: cycle list");
+            BuildCycleList(resetShuffleBag: false);
+            RestoreShuffleBagFromLoadedIds();
+
+            if (_pendingRandomRates)
+            {
+                cameraRotXRate = _pendingRandomX;
+                cameraRotYRate = _pendingRandomY;
+                cameraRotXText = cameraRotXRate.ToString("F2");
+                cameraRotYText = cameraRotYRate.ToString("F2");
+                _pendingRandomRates = false;
+                SaveToScenario();
+            }
+
+            // Step 6: HullcamVDS detection + restore
+            Debug.Log("[FastVesselChanger] onFlightReady step 6: hullcam");
+            DetectHullcamVDS();
+            var hullcamActiveVessel = FlightGlobals.ActiveVessel;
+            _instanceVesselId = hullcamActiveVessel?.id ?? Guid.Empty;
+            if (hullcamActiveVessel != null && _hullcamInstalled)
+                ApplyVesselHullcamSettings(hullcamActiveVessel);
+
+            // Activate hullcam immediately after setup — the scene is fully ready at
+            // this point (onFlightReady) so parts are loaded.  Activating here instead
+            // of step 11 eliminates the visible "flash" of the regular flight camera
+            // before the hullcam takes over.
+            bool hullcamActivatedEarly = false;
+            if (_hullcamInstalled)
+            {
+                ActivateHullcamIfReady();
+                hullcamActivatedEarly = _hullcamLastActivatedModule != null;
+            }
+
+            // Initialize per-vessel switch interval text for the current vessel
+            if (hullcamActiveVessel != null)
+            {
+                int pvInterval;
+                if (_vesselSwitchIntervals.TryGetValue(hullcamActiveVessel.id, out pvInterval))
+                {
+                    switchInterval = pvInterval;
+                    switchIntervalText = pvInterval.ToString();
+                }
+            }
+
+            // Step 7: UI state sync
+            Debug.Log("[FastVesselChanger] onFlightReady step 7: UI state");
+            _staticUserPreferredUIVisible = userPreferredUIVisible;
+            if (!userPreferredUIVisible)
+            {
+                InvokeHideUI();
+                // Reset the realtime deadline: KSP's own deferred UI setup can
+                // re-show the HUD after our initial hide.  LateUpdate will keep
+                // calling InvokeHideUI() every frame until the deadline expires.
+                _uiHideDeadlineRealtime = Time.realtimeSinceStartup + UI_HIDE_DURATION;
+            }
+            else
+            {
+                _uiHideDeadlineRealtime = 0f;
+            }
+
+            // Step 7b: Early zoom — apply pending zoom synchronously before any LateUpdate
+            // runs, giving the camera the correct distance as early as possible.  The
+            // end-of-frame coroutine will keep re-applying for ZOOM_RESTORE_FRAMES frames
+            // to fight any deferred SetTarget() calls.
+            // Skip when a hullcam was just activated — hullcam has its own camera,
+            // and forcing flight camera zoom would interfere.
+            if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && !hullcamActivatedEarly)
+            {
+                var cam = FlightCamera.fetch;
+                if (cam != null)
+                {
+                    if (!_camDistFieldSearched)
+                    {
+                        _camDistFieldSearched = true;
+                        _camDistField = cam.GetType().GetField("distance",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    }
+                    cam.SetDistanceImmediate(_pendingZoom);
+                    _camDistField?.SetValue(cam, _pendingZoom);
+                    Debug.Log("[FastVesselChanger] Early zoom applied in onFlightReady: " + _pendingZoom);
+                }
+            }
+
+            // Step 8: Camera pitch limits
+            Debug.Log("[FastVesselChanger] onFlightReady step 8: pitch limits");
+            WidenPitchLimits();
+
+            // Step 9: AppLauncher button
+            Debug.Log("[FastVesselChanger] onFlightReady step 9: AppLauncher");
+            GameEvents.onGUIApplicationLauncherReady.Add(OnGUIAppLauncherReady);
+            GameEvents.onGUIApplicationLauncherUnreadifying.Add(OnGUIAppLauncherUnreadifying);
+            _retryButtonCoroutine = StartCoroutine(RetryAppLauncherButton());
+
+            // Step 10: Coroutines
+            Debug.Log("[FastVesselChanger] onFlightReady step 10: coroutines");
+            _cameraPitchOverrideCoroutine = StartCoroutine(ApplyPitchOverridesEndOfFrame());
+            _twitchFileWriterCoroutine = StartCoroutine(TwitchFileWriterCoroutine());
+
+            // Step 11: Camera log
+            Debug.Log("[FastVesselChanger] onFlightReady step 11: camera log");
+            WriteCameraLogFile();
+
+            // Block phantom IMGUI clicks for 2 seconds after scene load.
+            _sceneLoadGraceRealtime = Time.realtimeSinceStartup + 2f;
+
+            // Safety fallback: if the blackout overlay is still armed but no hull cam
+            // activated (e.g. the vessel has no matching cameras), clear it now so the
+            // user doesn't stare at a black screen.
+            _pendingHullcamBlackout = false;
+
+            Debug.Log("[FastVesselChanger] onFlightReady COMPLETE — all deferred init done");
         }
-        _uiHoldCoroutine = null;
+        catch (Exception e)
+        {
+            Debug.LogError("[FastVesselChanger] onFlightReady FAILED: " + e.GetType().Name + ": " + e.Message + "\n" + e.StackTrace);
+        }
     }
 
 
     void InitializeVesselTypeFilter()
     {
-        // Initialize with standard KSP vessel types
-        string[] types = { "Ship", "Station", "Probe", "Lander", "Rover", "Plane", "Relay", "Flag", "Debris", "SpaceObject", "Unknown" };
-        foreach (var t in types)
-        {
-            vesselTypeFilter[t] = true; // Default: all types enabled
-        }
+        // Initialize with standard KSP vessel types.
+        // Exclude Flag/Debris/SpaceObject/Unknown by default — these are rarely wanted in the cycle list.
+        string[] enabledTypes = { "Ship", "Station", "Probe", "Lander", "Rover", "Plane", "Relay" };
+        string[] disabledTypes = { "Flag", "Debris", "SpaceObject", "Unknown" };
+        foreach (var t in enabledTypes)
+            vesselTypeFilter[t] = true;
+        foreach (var t in disabledTypes)
+            vesselTypeFilter[t] = false;
     }
 
     void Update()
     {
+        // Diagnostic heartbeat — runs even before _flightReady so we can detect main-thread freezes.
+        float now = Time.realtimeSinceStartup;
+        if (now - _lastHeartbeatRealtime >= HEARTBEAT_INTERVAL)
+        {
+            _lastHeartbeatRealtime = now;
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] HEARTBEAT frame=" + Time.frameCount
+                + " t=" + now.ToString("F1") + "s flightReady=" + _flightReady
+                + " scene=" + HighLogic.LoadedScene);
+        }
+
+        // Don't run any logic until the flight scene is fully initialized.
+        // Running during init can interfere with other mods (Kopernicus, Scatterer,
+        // Parallax) that read/write camera state during their setup phase.
+        if (!_flightReady)
+            return;
+
         // Enforce widened limits before stock FlightCamera input/clamp runs this frame.
         var camForLimits = FlightCamera.fetch;
         if (camForLimits != null)
@@ -440,19 +610,11 @@ public partial class FastVesselChanger : MonoBehaviour
 
         }
 
-        // Track F2 via Unity's input system. KSP's UIMasterController also handles F2 on its own,
-        // but we sync our preference here so the control panel indicator stays accurate.
-        // We don't call InvokeHideUI/ShowUI here because KSP's UIMasterController will do the
-        // actual toggle — we just need our preference field to match what KSP is doing.
-        if (Input.GetKeyDown(KeyCode.F2))
-        {
-            userPreferredUIVisible = !userPreferredUIVisible;
-            // If KSP's UIMasterController ran before this Update() and fired onShowUI,
-            // OnShowUI may have already suppressed the show. Re-assert the correct state.
-            if (userPreferredUIVisible)
-                InvokeShowUI();
-            SaveToScenario();
-        }
+        // F2 is handled entirely by KSP's native UIMasterController.  Our
+        // onShowUI / onHideUI callbacks update userPreferredUIVisible when KSP
+        // fires them.  The _uiToggleGuard flag prevents the callbacks from
+        // double-flipping userPreferredUIVisible when our *button* calls
+        // InvokeHideUI/InvokeShowUI (which may fire those same events).
 
         // Changed hotkey from C to /
         if (Input.GetKeyDown(KeyCode.Slash))
@@ -465,8 +627,16 @@ public partial class FastVesselChanger : MonoBehaviour
         if (autoEnabled && FlightGlobals.ready)
         {
             double ut = Planetarium.GetUniversalTime();
-            // Enforce both the user-configured interval AND the minimum time
-            double minimumAllowedInterval = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+            // Use per-vessel interval if set, otherwise fall back to global
+            int effectiveInterval = switchInterval;
+            var av = FlightGlobals.ActiveVessel;
+            if (av != null)
+            {
+                int perVessel;
+                if (_vesselSwitchIntervals.TryGetValue(av.id, out perVessel))
+                    effectiveInterval = perVessel;
+            }
+            double minimumAllowedInterval = Math.Max(effectiveInterval, MINIMUM_SWITCH_INTERVAL);
             if (ut - lastSwitchTime >= minimumAllowedInterval)
             {
                 SwitchToNext();
@@ -474,108 +644,53 @@ public partial class FastVesselChanger : MonoBehaviour
             }
         }
 
-        // Zoom restore — pre-seed as soon as target is active, then hard-lock briefly
-        // to suppress transition-time camera systems from overriding the restore.
-        if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty)
+        // ---- Post-switch health monitor ----
+        // The watchdog is only cleared when BOTH conditions are met:
+        //   1. The vessel passes basic health checks (loaded, rootPart.transform accessible)
+        //   2. GameEvents.onFlightReady has fired (the "all systems started" milestone)
+        // Without #2, the watchdog was clearing even when KSP was stuck in a permanent
+        // NRE cascade (e.g. FlightGlobals.UpdateInformation) — the vessel looked healthy
+        // but the scene never fully loaded, causing a permanent freeze.
+        if (_switchWatchdogRealtime > 0f && _switchWatchdogTargetId != Guid.Empty)
         {
-            if (Time.realtimeSinceStartup > _pendingZoomDeadlineRealtime)
+            bool vesselHealthy = false;
+            try
             {
-                VerboseLog("[FastVesselChanger] RestoreZoom timeout: target vessel did not become ready before deadline", warning: true);
-                _pendingZoomVesselId = Guid.Empty;
-                _pendingZoomRestore = false;
-                _pendingZoomDeadlineRealtime = 0f;
+                var av = FlightGlobals.ActiveVessel;
+                if (av != null && FlightGlobals.ready && av.loaded
+                    && av.rootPart != null && av.rootPart.transform != null)
+                {
+                    vesselHealthy = true;
+                }
             }
+            catch { /* transform access threw — not healthy */ }
 
-            var activeVessel = FlightGlobals.ActiveVessel;
-            if (_pendingZoomVesselId != Guid.Empty && activeVessel != null && activeVessel.id == _pendingZoomVesselId)
+            if (vesselHealthy && _switchWatchdogFlightReady)
             {
-                var cam = FlightCamera.fetch;
-                if (cam != null)
-                {
-                    // Cache the backing field once; guard with a sentinel so a failed lookup
-                    // doesn't trigger an expensive GetFields scan on every restore call.
-                    if (!_camDistFieldSearched)
-                    {
-                        _camDistFieldSearched = true;
-                        // In this version of KSP RSS the backing field is "distance", not "camDistance".
-                        _camDistField = cam.GetType().GetField("distance",
-                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                        VerboseLog("[FastVesselChanger] FlightCamera distance field lookup: "
-                            + (_camDistField != null ? "found '" + _camDistField.Name + "'" : "NOT FOUND"));
-                    }
-
-                    // Log on the very first frame so we can see what's available
-                    if (!_pendingZoomLoggedFirstFrame)
-                    {
-                        _pendingZoomLoggedFirstFrame = true;
-                        VerboseLog("[FastVesselChanger] RestoreZoom start: target=" + _pendingZoom
-                            + " current=" + cam.Distance
-                            + " camDistField=" + (_camDistField != null ? _camDistField.Name : "NOT FOUND"));
-                    }
-
-                    // Pre-seed immediately when the target vessel becomes active.
-                    cam.SetDistanceImmediate(_pendingZoom);
-                    _camDistField?.SetValue(cam, _pendingZoom);
-                    VerboseLog("[FastVesselChanger] RestoreZoom pre-seed applied: target=" + _pendingZoom + " final=" + cam.Distance);
-
-                    // Aggressive lockout window — keep forcing zoom to block user scroll
-                    // and other camera writers during the immediate post-load transition.
-                    _zoomLockoutVesselId = _pendingZoomVesselId;
-                    _zoomLockoutTarget = _pendingZoom;
-                    _zoomLockoutUntilRealtime = Time.realtimeSinceStartup + ZOOM_LOCKOUT_SECONDS;
-                    VerboseLog("[FastVesselChanger] RestoreZoom lockout started: seconds=" + ZOOM_LOCKOUT_SECONDS.ToString("F1") + " target=" + _zoomLockoutTarget);
-
-                    // Pending restore is consumed; lockout enforces the value for a short window.
-                    _pendingZoomVesselId = Guid.Empty;
-                    _pendingZoomRestore = false;
-                    _pendingZoomDeadlineRealtime = 0f;
-                }
-                else
-                {
-                    // Camera not ready yet — keep waiting until realtime deadline.
-                    if (!_pendingZoomLoggedFirstFrame)
-                    {
-                        _pendingZoomLoggedFirstFrame = true;
-                        VerboseLog("[FastVesselChanger] RestoreZoom: FlightCamera.fetch is null, waiting...", warning: true);
-                    }
-                }
+                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] Post-switch health check passed — watchdog cleared");
+                _switchWatchdogRealtime = 0f;
+                _switchWatchdogTargetId = Guid.Empty;
             }
             else
             {
-                // Vessel transition still in progress — FlightGlobals.ActiveVessel lags behind
-                // SetActiveVessel by several frames (or longer on heavily modded installs).
-                // Keep the restore request pending until the target vessel is actually active,
-                // bounded by the realtime deadline set when the request is queued.
-                VerboseLog("[FastVesselChanger] RestoreZoom waiting: active="
-                    + (activeVessel != null ? activeVessel.id.ToString() : "null")
-                    + " target=" + _pendingZoomVesselId.ToString());
-            }
-        }
+                float elapsed = Time.realtimeSinceStartup - _switchWatchdogRealtime;
 
-        // During lockout we aggressively force zoom every frame for the target vessel.
-        if (_zoomLockoutUntilRealtime > 0f && _zoomLockoutVesselId != Guid.Empty)
-        {
-            if (Time.realtimeSinceStartup > _zoomLockoutUntilRealtime)
-            {
-                VerboseLog("[FastVesselChanger] RestoreZoom lockout ended");
-                _zoomLockoutVesselId = Guid.Empty;
-                _zoomLockoutTarget = 0f;
-                _zoomLockoutUntilRealtime = 0f;
-            }
-            else
-            {
-                var lockoutVessel = FlightGlobals.ActiveVessel;
-                if (lockoutVessel != null && lockoutVessel.id == _zoomLockoutVesselId)
+                if (elapsed >= SWITCH_WATCHDOG_TIMEOUT)
                 {
-                    var lockoutCam = FlightCamera.fetch;
-                    if (lockoutCam != null)
-                    {
-                        lockoutCam.SetDistanceImmediate(_zoomLockoutTarget);
-                        _camDistField?.SetValue(lockoutCam, _zoomLockoutTarget);
-                    }
+                    // Informational only — log the failure but do NOT take recovery actions.
+                    Debug.LogError("[FastVesselChanger] Stuck-switch watchdog timeout after "
+                        + elapsed.ToString("F0") + "s. vesselHealthy="
+                        + vesselHealthy + " flightReady=" + _switchWatchdogFlightReady
+                        + ". No automatic recovery will be attempted.");
+                    ScreenMessages.PostScreenMessage("FVC: Vessel switch may be stuck (see KSP.log)", 10f, ScreenMessageStyle.UPPER_CENTER);
+
+                    _switchWatchdogRealtime = 0f;
+                    _switchWatchdogTargetId = Guid.Empty;
                 }
             }
         }
+
+        // (UI re-assertion moved to end-of-frame coroutine for per-frame reliability)
 
         if (cameraRotEnabled)
         {
@@ -590,11 +705,50 @@ public partial class FastVesselChanger : MonoBehaviour
         UpdateHullcam();
     }
 
+    void LateUpdate()
+    {
+        // Pre-render zoom restore: override any FlightCamera.SetTarget() calls that
+        // fired during Update/coroutine phase this frame.  LateUpdate runs BEFORE
+        // the frame is rendered (unlike WaitForEndOfFrame which runs AFTER), so the
+        // user never sees a frame at the wrong zoom.
+        // Frame countdown is managed by ApplyPitchOverridesEndOfFrame; this just applies.
+        if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && _pendingZoomFramesRemaining > 0)
+        {
+            var cam = FlightCamera.fetch;
+            if (cam != null)
+            {
+                var activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null && activeVessel.id == _pendingZoomVesselId)
+                {
+                    if (!_camDistFieldSearched)
+                    {
+                        _camDistFieldSearched = true;
+                        _camDistField = cam.GetType().GetField("distance",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    }
+                    cam.SetDistanceImmediate(_pendingZoom);
+                    _camDistField?.SetValue(cam, _pendingZoom);
+                }
+            }
+        }
+
+        // Pre-render UI hide: prevents flicker by hiding the HUD before the frame
+        // is drawn.  Uses a realtime deadline instead of frame count so slow/modded
+        // systems that take longer to reach OnFlightReady are still covered.
+        if (!userPreferredUIVisible && Time.realtimeSinceStartup < _uiHideDeadlineRealtime)
+        {
+            InvokeHideUI();
+        }
+    }
+
     IEnumerator ApplyPitchOverridesEndOfFrame()
     {
         while (true)
         {
             yield return new WaitForEndOfFrame();
+
+            // Don't touch camera until flight scene is fully ready.
+            if (!_flightReady) continue;
 
             var cam = FlightCamera.fetch;
             if (cam == null) continue;
@@ -617,6 +771,75 @@ public partial class FastVesselChanger : MonoBehaviour
 
             if (cameraRotEnabled && cameraRotXRate != 0f)
                 cam.camPitch += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
+
+            // Zoom restore — applied every end-of-frame for ZOOM_RESTORE_FRAMES frames.
+            // KSP's FlightCamera.SetTarget() is called asynchronously during scene init
+            // and can fire several frames AFTER onFlightReady, resetting `distance` to
+            // the vessel's default.  By re-applying every frame for ~1.5s, we guarantee
+            // our saved zoom overrides any deferred camera setup.
+            if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && _pendingZoomFramesRemaining > 0)
+            {
+                var activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null && activeVessel.id == _pendingZoomVesselId)
+                {
+                    // Cache the backing field once
+                    if (!_camDistFieldSearched)
+                    {
+                        _camDistFieldSearched = true;
+                        _camDistField = cam.GetType().GetField("distance",
+                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    }
+
+                    cam.SetDistanceImmediate(_pendingZoom);
+                    _camDistField?.SetValue(cam, _pendingZoom);
+
+                    _pendingZoomFramesRemaining--;
+                    if (_pendingZoomFramesRemaining <= 0)
+                    {
+                        _pendingZoomVesselId = Guid.Empty;
+                        _pendingZoomRestore = false;
+                        VerboseLog("[FastVesselChanger] RestoreZoom complete after " + ZOOM_RESTORE_FRAMES + " frames: final=" + cam.Distance);
+                    }
+                }
+            }
+
+            // (UI hide re-assertion handled by LateUpdate())
+        }
+    }
+
+    // Reads just the UIVisible preference from the XML file.  Called in Awake() so
+    // the hide logic is correct from the very first frame, even when entering flight
+    // from the Space Center (where _staticUserPreferredUIVisible may be stale/true
+    // while the on-disk preference is false).
+    void LoadEarlyUIPreference()
+    {
+        try
+        {
+            string prefsPath = GetUserPrefsPath();
+            if (!File.Exists(prefsPath)) return;
+
+            var doc = new XmlDocument();
+            doc.Load(prefsPath);
+            XmlElement root = doc.DocumentElement;
+            if (root == null) return;
+
+            string playerKey;
+            try { playerKey = FVCLunaHelper.GetCurrentPlayerName(); }
+            catch { playerKey = "default"; }
+
+            XmlElement playerSection = null;
+            foreach (XmlElement el in root.GetElementsByTagName("Player"))
+            {
+                if (el.GetAttribute("name") == playerKey) { playerSection = el; break; }
+            }
+            if (playerSection == null) return;
+
+            userPreferredUIVisible = ParseBool(playerSection["UIVisible"]?.InnerText, true);
+            _staticUserPreferredUIVisible = userPreferredUIVisible;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[FastVesselChanger] LoadEarlyUIPreference failed: " + e.Message);
         }
     }
 
@@ -652,16 +875,38 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void OnGUI()
     {
-        if (!showWindow) return;
+        // Hullcam blackout overlay — covers the screen while waiting for the hull cam
+        // to activate, preventing the jarring flash of the stock FlightCamera.
+        // Drawn before the _flightReady check so it covers the loading phase.
+        if (_pendingHullcamBlackout)
+        {
+            if (Time.realtimeSinceStartup > _hullcamBlackoutDeadline)
+            {
+                _pendingHullcamBlackout = false; // safety timeout
+            }
+            else
+            {
+                if (_blackTex == null)
+                {
+                    _blackTex = new Texture2D(1, 1);
+                    _blackTex.SetPixel(0, 0, Color.black);
+                    _blackTex.Apply();
+                }
+                GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), _blackTex);
+            }
+        }
+
+        if (!_flightReady || !showWindow) return;
         
         // Force window height recalculation when collapsible sections change
         if (showTypeFilter != lastShowTypeFilter || showCameraControls != lastShowCameraControls
-            || _showHullcamSection != _lastShowHullcamSection)
+            || _showHullcamSection != _lastShowHullcamSection || _showPresets != _lastShowPresets)
         {
             windowRect.height = 0; // Reset height to force GUILayout recalculation
             lastShowTypeFilter = showTypeFilter;
             lastShowCameraControls = showCameraControls;
             _lastShowHullcamSection = _showHullcamSection;
+            _lastShowPresets = _showPresets;
         }
         
         var prevRect = windowRect;
@@ -673,6 +918,16 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void DrawWindow(int id)
     {
+        // Lazy-init styled label for current vessel display
+        if (_currentVesselStyle == null)
+        {
+            _currentVesselStyle = new GUIStyle(GUI.skin.label)
+            {
+                fontStyle = FontStyle.Bold,
+                alignment = TextAnchor.MiddleCenter
+            };
+        }
+
         GUILayout.BeginVertical();
 
         // ---- Vessel List ----
@@ -682,9 +937,21 @@ public partial class FastVesselChanger : MonoBehaviour
         GUILayout.BeginHorizontal();
         GUILayout.Label("Vessels (" + selectedCount + " selected):");
         GUILayout.FlexibleSpace();
+        if (GUILayout.Button("Presets", GUILayout.Width(60)))
+        {
+            _showPresets = !_showPresets;
+            if (_showPresets)
+            {
+                RefreshSelectionsFromVessels();
+                RunAllPresetIntegrityChecks();
+            }
+        }
         if (GUILayout.Button("Refresh", GUILayout.Width(60)))
             RefreshSelectionsFromVessels();
         GUILayout.EndHorizontal();
+
+        // Preset section (collapsible, below header)
+        DrawPresetSection();
 
         // Search bar + filter toggle
         GUILayout.BeginHorizontal();
@@ -785,7 +1052,23 @@ public partial class FastVesselChanger : MonoBehaviour
 
         GUILayout.EndScrollView();
 
-        // Divider between vessel list and controls area.
+        // Divider between vessel list and current vessel.
+        GUILayout.Space(4);
+        GUILayout.Box("", GUILayout.Height(1), GUILayout.ExpandWidth(true));
+        GUILayout.Space(4);
+
+        // ---- Current Vessel ----
+        {
+            var cv = FlightGlobals.ActiveVessel;
+            string cvName = cv != null ? cv.vesselName : "—";
+            GUILayout.BeginHorizontal();
+            GUILayout.FlexibleSpace();
+            GUILayout.Label("Now Viewing:  " + cvName, _currentVesselStyle ?? GUI.skin.label);
+            GUILayout.FlexibleSpace();
+            GUILayout.EndHorizontal();
+        }
+
+        // Divider between current vessel and controls.
         GUILayout.Space(4);
         GUILayout.Box("", GUILayout.Height(1), GUILayout.ExpandWidth(true));
         GUILayout.Space(6);
@@ -856,6 +1139,10 @@ public partial class FastVesselChanger : MonoBehaviour
                 if (!autoEnabled || parsed >= remaining)
                 {
                     switchInterval = parsed;
+                    // Store per-vessel override
+                    var ivVessel = FlightGlobals.ActiveVessel;
+                    if (ivVessel != null)
+                        _vesselSwitchIntervals[ivVessel.id] = parsed;
                     pendingInterval = -1;
                 }
                 else
@@ -865,20 +1152,40 @@ public partial class FastVesselChanger : MonoBehaviour
             }
             GUILayout.EndHorizontal();
 
+            // Always render countdown label to maintain stable IMGUI layout;
+            // dynamic show/hide causes control-ID shift that produces phantom clicks
+            // on adjacent controls (same class of bug as the hullcam countdown).
             if (autoEnabled)
             {
-                double effectiveInterval2 = Math.Max(switchInterval, MINIMUM_SWITCH_INTERVAL);
+                int displayInterval = switchInterval;
+                var curV = FlightGlobals.ActiveVessel;
+                if (curV != null)
+                {
+                    int pvI;
+                    if (_vesselSwitchIntervals.TryGetValue(curV.id, out pvI))
+                        displayInterval = pvI;
+                }
+                double effectiveInterval2 = Math.Max(displayInterval, MINIMUM_SWITCH_INTERVAL);
                 double remaining2 = Math.Max(0, effectiveInterval2 - (Planetarium.GetUniversalTime() - lastSwitchTime));
                 GUILayout.Label("Next switch in: " + remaining2.ToString("F0") + "s");
+            }
+            else
+            {
+                GUILayout.Label(" ");
             }
 
             GUILayout.BeginHorizontal();
             GUILayout.Label("Flight UI: " + (userPreferredUIVisible ? "VISIBLE" : "HIDDEN"), GUILayout.Width(120));
             if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(120)))
             {
-                userPreferredUIVisible = !userPreferredUIVisible;
-                ToggleFlightHUD();
-                SaveToScenario();
+                // Ignore clicks during the post-scene-load grace period to prevent
+                // phantom IMGUI button hits from layout-shift during initialisation.
+                if (Time.realtimeSinceStartup > _sceneLoadGraceRealtime)
+                {
+                    // Cancel any aggressive re-hide — user explicitly wants to toggle.
+                    _uiHideDeadlineRealtime = 0f;
+                    ToggleFlightUI();
+                }
             }
             GUILayout.EndHorizontal();
 
@@ -1068,7 +1375,7 @@ public partial class FastVesselChanger : MonoBehaviour
         }
     }
 
-    void RestoreShuffleBagFromScenario(FastVesselChangerScenario? scen)
+    void RestoreShuffleBagFromLoadedIds()
     {
         shuffleRemaining.Clear();
 
@@ -1078,7 +1385,7 @@ public partial class FastVesselChanger : MonoBehaviour
             return;
         }
 
-        if (scen == null || scen.shuffleRemainingVesselIds.Count == 0)
+        if (_loadedShuffleBagIds.Count == 0)
         {
             shuffleRemaining.AddRange(cycleList);
             VerboseLog("[FastVesselChanger] Shuffle bag restore: no persisted remainder, starting fresh round (" + shuffleRemaining.Count + " vessels)");
@@ -1086,7 +1393,7 @@ public partial class FastVesselChanger : MonoBehaviour
         }
 
         var cycleById = cycleList.ToDictionary(v => v.id, v => v);
-        foreach (var id in scen.shuffleRemainingVesselIds)
+        foreach (var id in _loadedShuffleBagIds)
         {
             Guid vesselId;
             if (!Guid.TryParse(id, out vesselId))
@@ -1142,7 +1449,7 @@ public partial class FastVesselChanger : MonoBehaviour
         if (shuffleRemaining.Count == 0)
         {
             shuffleRemaining.AddRange(cycleList.Where(v => v != null));
-            Debug.Log("[FastVesselChanger] Shuffle bag refilled for new round (" + shuffleRemaining.Count + " vessels)");
+            if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] Shuffle bag refilled for new round (" + shuffleRemaining.Count + " vessels)");
         }
 
         if (shuffleRemaining.Count == 0) return;
@@ -1165,16 +1472,41 @@ public partial class FastVesselChanger : MonoBehaviour
         lastSwitchedVesselId = target.id;
     }
 
-    void ToggleFlightHUD()
+    /// Unified toggle used by BOTH the F2 key handler and the control-panel button.
+    /// Calls InvokeHideUI/ShowUI, flips userPreferredUIVisible, and syncs KSP's
+    /// internal F2 toggle field so subsequent F2 presses go the right direction.
+    void ToggleFlightUI()
     {
-        // Call UIMasterController directly — this is what KSP's F2 handler does internally.
-        // It updates the internal UI state AND notifies all UI elements via the game events.
-        if (userPreferredUIVisible)
-            InvokeShowUI();
-        else
-            InvokeHideUI();
+        _uiToggleGuard = true;
+        try
+        {
+            if (userPreferredUIVisible)
+                InvokeHideUI();
+            else
+                InvokeShowUI();
 
-        Debug.Log("[FastVesselChanger] ToggleFlightHUD invoked " + (userPreferredUIVisible ? "ShowUI" : "HideUI"));
+            userPreferredUIVisible = !userPreferredUIVisible;
+            _staticUserPreferredUIVisible = userPreferredUIVisible;
+
+            // Sync KSP's internal F2 toggle field so the next F2 press sees
+            // the correct state.  HideUI()/ShowUI() do NOT update isUIShowing.
+            // isUIShowing: true = visible, false = hidden.
+            if (_uiQuickHideField != null)
+            {
+                var inst = GetUIMasterInstance();
+                if (inst != null)
+                {
+                    try { _uiQuickHideField.SetValue(inst, userPreferredUIVisible); }
+                    catch { }
+                }
+            }
+
+            SaveToScenario();
+        }
+        finally
+        {
+            _uiToggleGuard = false;
+        }
     }
 
     void SwitchToVessel(Vessel v)
@@ -1186,8 +1518,6 @@ public partial class FastVesselChanger : MonoBehaviour
             Debug.LogWarning("[FastVesselChanger] SwitchToVessel aborted: FlightGlobals not ready");
             return;
         }
-
-        SaveUserPrefs();
 
         bool windowWasVisible = showWindow;
 
@@ -1243,10 +1573,49 @@ public partial class FastVesselChanger : MonoBehaviour
                 cam.setModeImmediate(FlightCamera.Modes.AUTO);
         }
 
-        // Start holding the UI hidden before the switch so no stage of the
-        // vessel transition can sneak the HUD back in.
+        // Re-verify game state after pre-switch operations.  The original
+        // FlightGlobals.ready check at the top of SwitchToVessel can pass, but
+        // DeactivateCurrentHullCam / SaveToScenario / packing events can corrupt
+        // the game state in the window between the check and SetActiveVessel.
+        if (!FlightGlobals.ready)
+        {
+            Debug.LogWarning("[FastVesselChanger] SwitchToVessel aborted: FlightGlobals became not-ready during pre-switch operations");
+            return;
+        }
+        try
+        {
+            var av = FlightGlobals.ActiveVessel;
+            if (av != null && av.rootPart != null)
+            {
+                var _ = av.rootPart.transform;  // throws if destroyed/corrupted
+            }
+        }
+        catch
+        {
+            Debug.LogError("[FastVesselChanger] SwitchToVessel aborted: active vessel transform is corrupted — cannot safely switch");
+            return;
+        }
+
+        // Assert hidden state before triggering the scene reload
         if (!userPreferredUIVisible)
-            RestartHoldUIHidden();
+            InvokeHideUI();
+
+        // If the destination vessel has hull cam enabled, arm the blackout overlay
+        // so OnGUI draws a full-screen black rect from scene-start until the hull cam
+        // activates inside OnFlightReady, hiding the stock FlightCamera flash.
+        VesselHullcamSettings hcSet;
+        if (_hullcamInstalled
+            && _vesselHullcamSettings.TryGetValue(v.id, out hcSet)
+            && hcSet.hullcamEnabled)
+        {
+            _pendingHullcamBlackout = true;
+            _hullcamBlackoutDeadline = Time.realtimeSinceStartup + 5f;
+        }
+
+        // Arm the stuck-switch watchdog (informational only).
+        _switchWatchdogRealtime = Time.realtimeSinceStartup;
+        _switchWatchdogTargetId = v.id;
+        _switchWatchdogFlightReady = false;
 
         try
         {
@@ -1254,60 +1623,32 @@ public partial class FastVesselChanger : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("[FastVesselChanger] Warning: SetActiveVessel failed: " + e.Message);
-            ScreenMessages.PostScreenMessage("FastVesselChanger: failed to activate vessel " + v.vesselName, 5f, ScreenMessageStyle.UPPER_CENTER);
+            Debug.LogError("[FastVesselChanger] SetActiveVessel failed: " + e.Message
+                + ". Watchdog armed — recovery in " + SWITCH_WATCHDOG_TIMEOUT + "s if scene reload does not complete.");
+            ScreenMessages.PostScreenMessage("FastVesselChanger: vessel switch failed — will retry in " + SWITCH_WATCHDOG_TIMEOUT + "s", 10f, ScreenMessageStyle.UPPER_CENTER);
             return;
         }
 
-        try
-        {
-            var cam = FlightCamera.fetch;
-            if (cam != null)
-            {
-                UnityEngine.Transform targetTransform = null;
-                if (v.rootPart != null)
-                {
-                    targetTransform = v.rootPart.transform;
-                }
-                else if (v.parts != null && v.parts.Count > 0)
-                {
-                    targetTransform = v.parts[0].transform;
-                }
-
-                if (targetTransform != null)
-                {
-                    cam.SetTarget(targetTransform);
-                }
-            }
-        }
-        catch (Exception e)
-        {
-            Debug.LogError("[FastVesselChanger] Error focusing camera: " + e.Message);
-        }
+        // NOTE: Do NOT call cam.SetTarget() here.  SetActiveVessel() triggers a
+        // full FLIGHT→FLIGHT scene reload that destroys the current FlightCamera and
+        // creates a new one.  Calling SetTarget on the old camera with a transform
+        // that's about to be destroyed is futile at best and can corrupt camera
+        // statics that bleed into the new scene.  The new scene's FlightDriver.Start()
+        // handles camera targeting automatically.
 
         // Restore window visibility after switch
         showWindow = windowWasVisible;
 
-        // Queue zoom restore — Update() will apply it every frame until it sticks or times out
+        // Queue zoom restore — end-of-frame coroutine will keep re-applying for
+        // ZOOM_RESTORE_FRAMES frames to override deferred FlightCamera.SetTarget() calls.
         float savedZoom;
         if (_vesselZooms.TryGetValue(v.id, out savedZoom))
         {
-            _zoomLockoutVesselId = Guid.Empty;
-            _zoomLockoutTarget = 0f;
-            _zoomLockoutUntilRealtime = 0f;
             _pendingZoomVesselId = v.id;
             _pendingZoom = savedZoom;
             _pendingZoomRestore = true;
-            _pendingZoomLoggedFirstFrame = false;
-            _pendingZoomDeadlineRealtime = Time.realtimeSinceStartup + 30f;
+            _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
             VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + savedZoom);
-        }
-        else
-        {
-            _zoomLockoutVesselId = Guid.Empty;
-            _zoomLockoutTarget = 0f;
-            _zoomLockoutUntilRealtime = 0f;
-            VerboseLog("[FastVesselChanger] RestoreZoom skipped: no saved zoom for vessel=" + v.vesselName + " id=" + v.id);
         }
 
         // Randomize camera rotation rates if enabled
@@ -1317,15 +1658,15 @@ public partial class FastVesselChanger : MonoBehaviour
                 || v.situation == Vessel.Situations.PRELAUNCH
                 || v.situation == Vessel.Situations.SPLASHED;
 
-            // Each axis is uniform [-4, 4]. Resample until the sum of magnitudes is >= 1.10,
+            // Each axis is uniform [-1.25, 1.25]. Resample until the sum of magnitudes is >= 0.70,
             // guaranteeing a noticeable combined rotation. When grounded, pitch (X) is forced
-            // to 0 so the constraint effectively becomes |Y| >= 1.10.
+            // to 0 so the constraint effectively becomes |Y| >= 0.70.
             float x, y;
             do
             {
-                x = isGrounded ? 0f : UnityEngine.Random.Range(-2.0f, 2.0f);
-                y = UnityEngine.Random.Range(-2.0f, 2.0f);
-            } while (Mathf.Abs(x) + Mathf.Abs(y) < 0.90f);
+                x = isGrounded ? 0f : UnityEngine.Random.Range(-1.25f, 1.25f);
+                y = UnityEngine.Random.Range(-1.25f, 1.25f);
+            } while (Mathf.Abs(x) + Mathf.Abs(y) < 0.70f);
 
             cameraRotXRate = x;
             cameraRotYRate = y;
@@ -1346,7 +1687,6 @@ public partial class FastVesselChanger : MonoBehaviour
     {
         try
         {
-            _loadedTypeFiltersFromUserPrefs = false;
             string prefsPath = GetUserPrefsPath();
             if (!File.Exists(prefsPath))
             {
@@ -1360,36 +1700,150 @@ public partial class FastVesselChanger : MonoBehaviour
             if (root == null)
                 return;
 
-            showCameraControls = ParseBool(root["ShowCameraControls"]?.InnerText, false);
-            lastShowCameraControls = showCameraControls;
-            showTypeFilter = ParseBool(root["ShowTypeFilter"]?.InnerText, false);
-            lastShowTypeFilter = showTypeFilter;
-            _showHullcamSection = ParseBool(root["ShowHullcamSection"]?.InnerText, true);
-            _lastShowHullcamSection = _showHullcamSection;
-            _writeLMPPlayersLog = ParseBool(root["WriteLMPPlayersLog"]?.InnerText, false);
-            _writeVesselLog = ParseBool(root["WriteVesselLog"]?.InnerText, false);
-            _writeCameraLog = ParseBool(root["WriteCameraLog"]?.InnerText, false);
+            // --- All settings are per-player ---
+            string playerKey = FVCLunaHelper.GetCurrentPlayerName();
+            XmlElement playerSection = null;
+            foreach (XmlElement el in root.GetElementsByTagName("Player"))
+            {
+                if (el.GetAttribute("name") == playerKey) { playerSection = el; break; }
+            }
+            if (playerSection == null)
+            {
+                Debug.Log("[FastVesselChanger] LoadUserPrefs: no player section for '" + playerKey + "', using defaults");
+                return;
+            }
 
-            XmlElement filters = root["TypeFilters"];
+            // UI settings (per-player)
+            showCameraControls = ParseBool(playerSection["ShowCameraControls"]?.InnerText, true);
+            lastShowCameraControls = showCameraControls;
+            showTypeFilter = ParseBool(playerSection["ShowTypeFilter"]?.InnerText, false);
+            lastShowTypeFilter = showTypeFilter;
+            _showHullcamSection = ParseBool(playerSection["ShowHullcamSection"]?.InnerText, false);
+            _lastShowHullcamSection = _showHullcamSection;
+            _writeLMPPlayersLog = ParseBool(playerSection["WriteLMPPlayersLog"]?.InnerText, false);
+            _writeVesselLog = ParseBool(playerSection["WriteVesselLog"]?.InnerText, false);
+            _writeCameraLog = ParseBool(playerSection["WriteCameraLog"]?.InnerText, false);
+
+            XmlElement filters = playerSection["TypeFilters"];
             if (filters != null)
             {
                 var enabledTypes = filters.GetElementsByTagName("Filter")
                     .OfType<XmlElement>()
                     .Select(filter => filter.GetAttribute("name"))
-                    .Where(name => !string.IsNullOrEmpty(name));
-                ApplyEnabledTypeFilters(enabledTypes);
-                _loadedTypeFiltersFromUserPrefs = true;
+                    .Where(name => !string.IsNullOrEmpty(name))
+                    .ToList();
+                if (enabledTypes.Count > 0)
+                    ApplyEnabledTypeFilters(enabledTypes);
             }
 
-            XmlElement window = root["Window"];
-            if (window == null)
-                return;
+            XmlElement window = playerSection["Window"];
+            if (window != null)
+            {
+                float wx = ParseFloat(window.GetAttribute("x"), windowRect.x);
+                float wy = ParseFloat(window.GetAttribute("y"), windowRect.y);
+                float ww = ParseFloat(window.GetAttribute("width"), windowRect.width);
+                float wh = ParseFloat(window.GetAttribute("height"), windowRect.height);
+                windowRect = new Rect(wx, wy, Mathf.Max(FIXED_WINDOW_WIDTH, ww), Mathf.Max(MIN_WINDOW_HEIGHT, wh));
+            }
 
-            float wx = ParseFloat(window.GetAttribute("x"), windowRect.x);
-            float wy = ParseFloat(window.GetAttribute("y"), windowRect.y);
-            float ww = ParseFloat(window.GetAttribute("width"), windowRect.width);
-            float wh = ParseFloat(window.GetAttribute("height"), windowRect.height);
-            windowRect = new Rect(wx, wy, Mathf.Max(FIXED_WINDOW_WIDTH, ww), Mathf.Max(MIN_WINDOW_HEIGHT, wh));
+            // Scalar settings
+            int parsedInt;
+            if (int.TryParse(playerSection["SwitchInterval"]?.InnerText, out parsedInt))
+                switchInterval = parsedInt;
+            switchIntervalText = switchInterval.ToString();
+            autoEnabled = ParseBool(playerSection["AutoEnabled"]?.InnerText, false);
+            showWindow = ParseBool(playerSection["ShowWindow"]?.InnerText, true);
+            userPreferredUIVisible = ParseBool(playerSection["UIVisible"]?.InnerText, true);
+            _staticUserPreferredUIVisible = userPreferredUIVisible;
+            cameraRotEnabled = ParseBool(playerSection["CameraRotEnabled"]?.InnerText, false);
+            cameraRotRandomEnabled = ParseBool(playerSection["CameraRotRandomEnabled"]?.InnerText, false);
+            cameraRotXRate = ParseFloat(playerSection["CameraRotXRate"]?.InnerText, 0f);
+            cameraRotYRate = ParseFloat(playerSection["CameraRotYRate"]?.InnerText, 0f);
+            cameraRotXText = cameraRotXRate.ToString("F1");
+            cameraRotYText = cameraRotYRate.ToString("F1");
+
+            // Selected vessels
+            XmlElement selVessels = playerSection["SelectedVessels"];
+            if (selVessels != null)
+            {
+                selected.Clear();
+                foreach (XmlElement v in selVessels.GetElementsByTagName("Vessel"))
+                {
+                    Guid g;
+                    if (Guid.TryParse(v.GetAttribute("id"), out g))
+                        selected[g] = true;
+                }
+            }
+
+            // Per-vessel zoom levels
+            XmlElement zoomsNode = playerSection["VesselZooms"];
+            if (zoomsNode != null)
+            {
+                _vesselZooms.Clear();
+                foreach (XmlElement z in zoomsNode.GetElementsByTagName("Zoom"))
+                {
+                    Guid vesselId;
+                    float zoom;
+                    if (!Guid.TryParse(z.GetAttribute("vessel"), out vesselId)) continue;
+                    if (!float.TryParse(z.GetAttribute("distance"), NumberStyles.Float, CultureInfo.InvariantCulture, out zoom)) continue;
+                    _vesselZooms[vesselId] = zoom;
+                }
+            }
+
+            // Per-vessel switch intervals
+            XmlElement intervalsNode = playerSection["VesselSwitchIntervals"];
+            if (intervalsNode != null)
+            {
+                _vesselSwitchIntervals.Clear();
+                foreach (XmlElement intEl in intervalsNode.GetElementsByTagName("Interval"))
+                {
+                    Guid vesselId;
+                    int seconds;
+                    if (!Guid.TryParse(intEl.GetAttribute("vessel"), out vesselId)) continue;
+                    if (!int.TryParse(intEl.GetAttribute("seconds"), out seconds)) continue;
+                    _vesselSwitchIntervals[vesselId] = seconds;
+                }
+            }
+
+            // Shuffle bag remainder — stored as vessel IDs, resolved against cycleList later
+            XmlElement shuffleNode = playerSection["ShuffleBag"];
+            if (shuffleNode != null)
+            {
+                _loadedShuffleBagIds.Clear();
+                foreach (XmlElement v in shuffleNode.GetElementsByTagName("Vessel"))
+                {
+                    _loadedShuffleBagIds.Add(v.GetAttribute("id"));
+                }
+            }
+
+            // Per-vessel hullcam settings
+            XmlElement hullcamsNode = playerSection["HullcamSettings"];
+            if (hullcamsNode != null)
+            {
+                _vesselHullcamSettings.Clear();
+                foreach (XmlElement hc in hullcamsNode.GetElementsByTagName("VesselHullcam"))
+                {
+                    Guid vesselId;
+                    if (!Guid.TryParse(hc.GetAttribute("vessel"), out vesselId)) continue;
+                    var s = new VesselHullcamSettings();
+                    s.hullcamEnabled = ParseBool(hc.GetAttribute("enabled"), false);
+                    s.hullcamInterval = Mathf.Max(1f, ParseFloat(hc.GetAttribute("interval"), 10f));
+                    s.includeExternal = ParseBool(hc.GetAttribute("includeExternal"), true);
+                    foreach (XmlElement cam in hc.GetElementsByTagName("SelectedCam"))
+                    {
+                        uint fid;
+                        if (uint.TryParse(cam.GetAttribute("flightId"), out fid))
+                            s.selectedFlightIds.Add(fid);
+                    }
+                    _vesselHullcamSettings[vesselId] = s;
+                }
+                Debug.Log("[FastVesselChanger] LoadUserPrefs: loaded " + _vesselHullcamSettings.Count + " hullcam entries");
+            }
+
+            // Presets
+            LoadPresetsFromXml(playerSection);
+
+            Debug.Log("[FastVesselChanger] LoadUserPrefs: loaded player '" + playerKey + "' settings");
         }
         catch (Exception e)
         {
@@ -1406,21 +1860,53 @@ public partial class FastVesselChanger : MonoBehaviour
             if (!string.IsNullOrEmpty(prefsDir))
                 Directory.CreateDirectory(prefsDir);
 
+            string playerKey = FVCLunaHelper.GetCurrentPlayerName();
+
+            // Read existing XML to preserve other players' sections
             var doc = new XmlDocument();
-            XmlElement root = doc.CreateElement("FastVesselChangerUserPrefs");
-            doc.AppendChild(root);
+            if (File.Exists(prefsPath))
+            {
+                try { doc.Load(prefsPath); } catch { }
+            }
 
-            XmlElement showCameraControlsNode = doc.CreateElement("ShowCameraControls");
-            showCameraControlsNode.InnerText = showCameraControls.ToString();
-            root.AppendChild(showCameraControlsNode);
+            XmlElement root = doc.DocumentElement;
+            if (root == null)
+            {
+                root = doc.CreateElement("FastVesselChangerUserPrefs");
+                doc.AppendChild(root);
+            }
 
-            XmlElement showTypeFilterNode = doc.CreateElement("ShowTypeFilter");
-            showTypeFilterNode.InnerText = showTypeFilter.ToString();
-            root.AppendChild(showTypeFilterNode);
+            // --- All settings are per-player ---
+            // Find or create the player section
+            XmlElement playerSection = null;
+            foreach (XmlElement el in root.GetElementsByTagName("Player"))
+            {
+                if (el.GetAttribute("name") == playerKey) { playerSection = el; break; }
+            }
+            if (playerSection == null)
+            {
+                playerSection = doc.CreateElement("Player");
+                playerSection.SetAttribute("name", playerKey);
+                root.AppendChild(playerSection);
+            }
+            // Clear and rebuild
+            playerSection.RemoveAll();
+            playerSection.SetAttribute("name", playerKey);
 
-            XmlElement showHullcamSectionNode = doc.CreateElement("ShowHullcamSection");
-            showHullcamSectionNode.InnerText = _showHullcamSection.ToString();
-            root.AppendChild(showHullcamSectionNode);
+            // UI settings (per-player)
+            SetXmlValue(doc, playerSection, "ShowCameraControls", showCameraControls.ToString());
+            SetXmlValue(doc, playerSection, "ShowTypeFilter", showTypeFilter.ToString());
+            SetXmlValue(doc, playerSection, "ShowHullcamSection", _showHullcamSection.ToString());
+            SetXmlValue(doc, playerSection, "WriteLMPPlayersLog", _writeLMPPlayersLog.ToString());
+            SetXmlValue(doc, playerSection, "WriteVesselLog", _writeVesselLog.ToString());
+            SetXmlValue(doc, playerSection, "WriteCameraLog", _writeCameraLog.ToString());
+
+            XmlElement windowNode = doc.CreateElement("Window");
+            windowNode.SetAttribute("x", windowRect.x.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("y", windowRect.y.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("width", windowRect.width.ToString(CultureInfo.InvariantCulture));
+            windowNode.SetAttribute("height", windowRect.height.ToString(CultureInfo.InvariantCulture));
+            playerSection.AppendChild(windowNode);
 
             XmlElement filtersNode = doc.CreateElement("TypeFilters");
             foreach (var kv in vesselTypeFilter.Where(kv => kv.Value))
@@ -1429,26 +1915,90 @@ public partial class FastVesselChanger : MonoBehaviour
                 filterNode.SetAttribute("name", kv.Key);
                 filtersNode.AppendChild(filterNode);
             }
-            root.AppendChild(filtersNode);
+            playerSection.AppendChild(filtersNode);
 
-            XmlElement windowNode = doc.CreateElement("Window");
-            windowNode.SetAttribute("x", windowRect.x.ToString(CultureInfo.InvariantCulture));
-            windowNode.SetAttribute("y", windowRect.y.ToString(CultureInfo.InvariantCulture));
-            windowNode.SetAttribute("width", windowRect.width.ToString(CultureInfo.InvariantCulture));
-            windowNode.SetAttribute("height", windowRect.height.ToString(CultureInfo.InvariantCulture));
-            root.AppendChild(windowNode);
+            // Simulation settings
+            SetXmlValue(doc, playerSection, "SwitchInterval", switchInterval.ToString());
+            SetXmlValue(doc, playerSection, "AutoEnabled", autoEnabled.ToString());
+            SetXmlValue(doc, playerSection, "ShowWindow", showWindow.ToString());
+            SetXmlValue(doc, playerSection, "UIVisible", userPreferredUIVisible.ToString());
+            SetXmlValue(doc, playerSection, "CameraRotEnabled", cameraRotEnabled.ToString());
+            SetXmlValue(doc, playerSection, "CameraRotRandomEnabled", cameraRotRandomEnabled.ToString());
+            SetXmlValue(doc, playerSection, "CameraRotXRate", cameraRotXRate.ToString(CultureInfo.InvariantCulture));
+            SetXmlValue(doc, playerSection, "CameraRotYRate", cameraRotYRate.ToString(CultureInfo.InvariantCulture));
 
-            XmlElement writeLMPPlayersLogNode = doc.CreateElement("WriteLMPPlayersLog");
-            writeLMPPlayersLogNode.InnerText = _writeLMPPlayersLog.ToString();
-            root.AppendChild(writeLMPPlayersLogNode);
+            // Selected vessels
+            XmlElement selVessels = doc.CreateElement("SelectedVessels");
+            foreach (var kv in selected)
+            {
+                if (kv.Value)
+                {
+                    XmlElement v = doc.CreateElement("Vessel");
+                    v.SetAttribute("id", kv.Key.ToString());
+                    selVessels.AppendChild(v);
+                }
+            }
+            playerSection.AppendChild(selVessels);
 
-            XmlElement writeVesselLogNode = doc.CreateElement("WriteVesselLog");
-            writeVesselLogNode.InnerText = _writeVesselLog.ToString();
-            root.AppendChild(writeVesselLogNode);
+            // Shuffle bag remainder
+            XmlElement shuffleNode = doc.CreateElement("ShuffleBag");
+            foreach (var remaining in shuffleRemaining)
+            {
+                if (remaining != null)
+                {
+                    XmlElement v = doc.CreateElement("Vessel");
+                    v.SetAttribute("id", remaining.id.ToString());
+                    shuffleNode.AppendChild(v);
+                }
+            }
+            playerSection.AppendChild(shuffleNode);
 
-            XmlElement writeCameraLogNode = doc.CreateElement("WriteCameraLog");
-            writeCameraLogNode.InnerText = _writeCameraLog.ToString();
-            root.AppendChild(writeCameraLogNode);
+            // Per-vessel switch intervals
+            XmlElement intervalsNode = doc.CreateElement("VesselSwitchIntervals");
+            foreach (var kvInt in _vesselSwitchIntervals)
+            {
+                XmlElement intEl = doc.CreateElement("Interval");
+                intEl.SetAttribute("vessel", kvInt.Key.ToString());
+                intEl.SetAttribute("seconds", kvInt.Value.ToString());
+                intervalsNode.AppendChild(intEl);
+            }
+            playerSection.AppendChild(intervalsNode);
+
+            // Per-vessel zoom levels
+            XmlElement zoomsNode = doc.CreateElement("VesselZooms");
+            foreach (var kvZoom in _vesselZooms)
+            {
+                if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
+                XmlElement z = doc.CreateElement("Zoom");
+                z.SetAttribute("vessel", kvZoom.Key.ToString());
+                z.SetAttribute("distance", kvZoom.Value.ToString(CultureInfo.InvariantCulture));
+                zoomsNode.AppendChild(z);
+            }
+            playerSection.AppendChild(zoomsNode);
+
+            // Per-vessel hullcam settings
+            SyncCurrentHullcamStateToDict();
+            XmlElement hullcamsNode = doc.CreateElement("HullcamSettings");
+            foreach (var kvHc in _vesselHullcamSettings)
+            {
+                var hs = kvHc.Value;
+                XmlElement hc = doc.CreateElement("VesselHullcam");
+                hc.SetAttribute("vessel", kvHc.Key.ToString());
+                hc.SetAttribute("enabled", hs.hullcamEnabled.ToString());
+                hc.SetAttribute("interval", hs.hullcamInterval.ToString(CultureInfo.InvariantCulture));
+                hc.SetAttribute("includeExternal", hs.includeExternal.ToString());
+                foreach (var fid in hs.selectedFlightIds)
+                {
+                    XmlElement cam = doc.CreateElement("SelectedCam");
+                    cam.SetAttribute("flightId", fid.ToString());
+                    hc.AppendChild(cam);
+                }
+                hullcamsNode.AppendChild(hc);
+            }
+            playerSection.AppendChild(hullcamsNode);
+
+            // Presets
+            SavePresetsToXml(doc, playerSection);
 
             doc.Save(prefsPath);
         }
@@ -1456,6 +2006,13 @@ public partial class FastVesselChanger : MonoBehaviour
         {
             Debug.LogWarning("[FastVesselChanger] SaveUserPrefs error: " + e.Message);
         }
+    }
+
+    static void SetXmlValue(XmlDocument doc, XmlElement parent, string name, string value)
+    {
+        XmlElement el = parent[name];
+        if (el == null) { el = doc.CreateElement(name); parent.AppendChild(el); }
+        el.InnerText = value;
     }
 
     string GetUserPrefsPath()
@@ -1494,76 +2051,27 @@ public partial class FastVesselChanger : MonoBehaviour
         {
             // Snapshot current vessel's zoom before serializing so it isn't lost
             // when saving without having switched away from it first.
-            // Use _instanceVesselId (pinned at Start) instead of FlightGlobals.ActiveVessel:
-            // after SetActiveVessel, ActiveVessel points to the NEW vessel while the camera
-            // still reflects the OLD vessel — writing cam.Distance against the new ID would
-            // corrupt its zoom entry.  _instanceVesselId is always the vessel this instance
-            // was created for.
-            if (_instanceVesselId != Guid.Empty)
+            // SKIP the snapshot when a zoom restore is in progress: during a
+            // FLIGHT\u2192FLIGHT reload (including OnDestroy) cam.Distance is
+            // stale/default, so snapshotting would overwrite the correct value
+            // that SwitchToVessel already placed in the dict.
+            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0)
             {
                 var cam = FlightCamera.fetch;
-                // Only snapshot zoom when the stock FlightCamera is in control.
-                // If a hull cam is active, cam.Distance reflects the hull cam mount
-                // position, not the orbit view distance — don't overwrite the saved value.
                 if (cam != null && _hullcamLastActivatedModule == null)
                     _vesselZooms[_instanceVesselId] = cam.Distance;
             }
 
-            var scen = FastVesselChangerScenario.Instance;
-            if (scen != null)
-            {
-                scen.switchInterval = switchInterval;
-                scen.autoEnabled = autoEnabled;
-                scen.showWindow = showWindow;
-                scen.uiVisible = userPreferredUIVisible;
-                scen.cameraRotEnabled = cameraRotEnabled;
-                scen.cameraRotRandomEnabled = cameraRotRandomEnabled;
-                scen.cameraRotXRate = cameraRotXRate;
-                scen.cameraRotYRate = cameraRotYRate;
-                scen.selectedVesselIds.Clear();
-                scen.selectedVesselTypes.Clear();
-                scen.shuffleRemainingVesselIds.Clear();
-                scen.vesselZoomEntries.Clear();
-                
-                foreach (var kv in selected)
-                {
-                    if (kv.Value) scen.selectedVesselIds.Add(kv.Key.ToString());
-                }
-                
-                foreach (var kvType in vesselTypeFilter)
-                {
-                    if (kvType.Value) scen.selectedVesselTypes.Add(kvType.Key);
-                }
+            // Sync active vessel's hull cam state to the dict before serializing
+            SyncCurrentHullcamStateToDict();
 
-                foreach (var remaining in shuffleRemaining)
-                {
-                    if (remaining != null)
-                        scen.shuffleRemainingVesselIds.Add(remaining.id.ToString());
-                }
+            // All persistence now goes through the XML file
+            SaveUserPrefs();
 
-                foreach (var kvZoom in _vesselZooms)
-                {
-                    if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
-                    scen.vesselZoomEntries.Add(kvZoom.Key + "|" + kvZoom.Value.ToString(CultureInfo.InvariantCulture));
-                }
-
-                // Sync active vessel's hull cam state to the dict before serializing
-                SyncCurrentHullcamStateToDict();
-                scen.vesselHullcamEntries.Clear();
-                scen.vesselHullcamSelectedCams.Clear();
-                foreach (var kvHc in _vesselHullcamSettings)
-                {
-                    var hs = kvHc.Value;
-                    scen.vesselHullcamEntries.Add(kvHc.Key + "|" + hs.hullcamEnabled + "|" +
-                        hs.hullcamInterval.ToString(CultureInfo.InvariantCulture) + "|" + hs.includeExternal);
-                    foreach (var fid in hs.selectedFlightIds)
-                        scen.vesselHullcamSelectedCams.Add(kvHc.Key + "|" + fid);
-                }
-                if (VERBOSE_DIAGNOSTICS)
-                    Debug.Log("[FastVesselChanger] SaveToScenario: hullcamEntries=" + scen.vesselHullcamEntries.Count
-                        + " hullcamCams=" + scen.vesselHullcamSelectedCams.Count
-                        + " (activeVesselSelectedIds=" + _hullcamSelectedIds.Count + ")");
-            }
+            if (VERBOSE_DIAGNOSTICS)
+                Debug.Log("[FastVesselChanger] SaveToScenario: persisted to XML"
+                    + " (vesselZooms=" + _vesselZooms.Count
+                    + " hullcamEntries=" + _vesselHullcamSettings.Count + ")");
         }
         catch (Exception e)
         {
@@ -1797,13 +2305,17 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void OnDestroy()
     {
+        Debug.Log("[FastVesselChanger] OnDestroy() enter");
         bool isActiveInstance = _activeInstance == this;
 
         if (isActiveInstance)
             _activeInstance = null;
 
-        GameEvents.onShowUI.Remove(OnShowUI);
-        GameEvents.onVesselLoaded.Remove(OnVesselLoaded);
+        // Remove per-instance event handlers
+        try { GameEvents.onShowUI.Remove(OnShowUI_Instance); } catch { }
+        try { GameEvents.onHideUI.Remove(OnHideUI_Instance); } catch { }
+        try { GameEvents.onVesselLoaded.Remove(OnVesselLoaded); } catch { }
+        try { GameEvents.onFlightReady.Remove(OnFlightReady); } catch { }
         GameEvents.onGUIApplicationLauncherReady.Remove(OnGUIAppLauncherReady);
         GameEvents.onGUIApplicationLauncherUnreadifying.Remove(OnGUIAppLauncherUnreadifying);
 
@@ -1855,22 +2367,24 @@ public partial class FastVesselChanger : MonoBehaviour
 
         // Ensure UI is visible when truly leaving the flight scene (KSC, tracking
         // station, quit) so the player isn't stuck with a hidden HUD.  During a
-        // FLIGHT→FLIGHT vessel switch the next scene is still FLIGHT and the new
-        // FVC instance will re-apply the hidden state in Start().  Calling ShowUI
-        // in that case causes a visible flicker — the UI pops in for several
-        // frames until the new instance hides it again.
+        // FLIGHT→FLIGHT vessel switch HighLogic.LoadedScene is still FLIGHT (the
+        // destination), so leavingFlight stays false and we skip the ShowUI — the
+        // new FVC instance handles UI state via Awake().  Calling ShowUI here
+        // during FLIGHT→FLIGHT would flash the HUD visibly for ~0.5 s until the
+        // new instance hides it again (the old bug).
         bool leavingFlight = HighLogic.LoadedScene != GameScenes.FLIGHT;
-        if (leavingFlight || userPreferredUIVisible)
+        if (leavingFlight)
         {
             try
             {
                 InvokeShowUI();
-                Debug.Log("[FastVesselChanger] Showing UI when leaving flight scene");
+                Debug.Log("[FastVesselChanger] Restored UI visibility before leaving flight scene");
             }
             catch { }
         }
         
         RemoveAppLauncherButton("OnDestroy", forceClearShared: false);
+        Debug.Log("[FastVesselChanger] OnDestroy() complete");
     }
 
     // -------------------------------------------------------------------------
@@ -2467,4 +2981,7 @@ public partial class FastVesselChanger : MonoBehaviour
         if (forceClearShared || removed)
             _sharedAppButton = null;
     }
+
+    // -------------------------------------------------------------------------
+    // Recovery Sentinel — survives scene transitions via DontDestroyOnLoad
 }

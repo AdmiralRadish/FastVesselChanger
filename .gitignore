@@ -19,10 +19,14 @@ LUNAMULTIPLAYER.md
 *.htm
 NuGet.config
 *ns.md
+*.log
 
 # GameData Plugins (built output — not source-controlled)
 GameData/*/Plugins/*.dll
 GameData/*/Plugins/*.pdb
+
+# Runtime-generated user prefs (per-player settings, not distributable)
+GameData/*/PluginData/FastVesselChanger.xml
 
 # Rider
 .idea/
