@@ -28,6 +28,7 @@ public partial class FastVesselChanger
     private static PropertyInfo _hullcamIsActiveProp = null;
     private static FieldInfo _hullcamIsActiveField = null;
     private static FieldInfo _hullcamCameraNameField = null;
+    private static FieldInfo _hullcamCamEnabledField = null;
     // Per-vessel hull cam settings (static, survives vessel-switch addon recreation like _vesselZooms)
     private static Dictionary<Guid, VesselHullcamSettings> _vesselHullcamSettings = new Dictionary<Guid, VesselHullcamSettings>();
 
@@ -35,6 +36,7 @@ public partial class FastVesselChanger
     // Invalidated when vessel changes (checked via ID) or when RebuildHullCamRotation is called.
     private List<HullCamEntry> _cachedVesselCams = new List<HullCamEntry>();
     private Guid _cachedVesselCamsId = Guid.Empty;
+    private float _cachedVesselCamsTime = 0f;
 
     // Hull cam state for the active vessel (instance — reset on each addon recreation)
     private const float HULLCAM_MIN_INTERVAL = 10f;
@@ -72,7 +74,7 @@ public partial class FastVesselChanger
         public HashSet<uint> selectedFlightIds = new HashSet<uint>();
     }
 
-    private struct HullCamEntry { public Part part; public object module; }
+    private struct HullCamEntry { public Part part; public object module; public bool disabled; }
 
     void DetectHullcamVDS()
     {
@@ -158,12 +160,16 @@ public partial class FastVesselChanger
                 _hullcamCameraNameField  = _hullcamModuleType.GetField("cameraName", instF)
                                         ?? _hullcamModuleType.GetField("CameraName", instF);
 
+                _hullcamCamEnabledField  = _hullcamModuleType.GetField("camEnabled", instF)
+                                        ?? _hullcamModuleType.GetField("CamEnabled", instF);
+
                 Debug.Log("[FastVesselChanger] HullcamVDS type resolved:"
                     + "\n  ActivateCamera=" + (_hullcamActivateMethod?.Name ?? "null")
                     + "\n  LeaveCamera=" + (_hullcamDeactivateMethod?.Name ?? "null")
                     + "\n  sCurrentCamera=" + (_hullcamCurrentCamField?.Name ?? "null")
                     + "\n  camActive=" + (_hullcamIsActiveField?.Name ?? "null")
-                    + "\n  cameraName=" + (_hullcamCameraNameField?.Name ?? "null"));
+                    + "\n  cameraName=" + (_hullcamCameraNameField?.Name ?? "null")
+                    + "\n  camEnabled=" + (_hullcamCamEnabledField?.Name ?? "null"));
             }
             else
             {
@@ -195,7 +201,7 @@ public partial class FastVesselChanger
                 // String comparison avoids assembly-identity issues from KSP's custom loader.
                 if (fullName != null && fullName.StartsWith("HullcamVDS.MuMechModuleHullCamera"))
                 {
-                    result.Add(new HullCamEntry { part = part, module = mod });
+                    result.Add(new HullCamEntry { part = part, module = mod, disabled = IsHullCamDisabled(mod) });
                     break; // one camera module per part
                 }
             }
@@ -215,6 +221,25 @@ public partial class FastVesselChanger
             catch { }
         }
         return part?.partInfo?.title ?? part?.partName ?? "Hull Camera";
+    }
+
+    bool IsHullCamDisabled(object module)
+    {
+        if (module == null) return true;
+        // Check HullcamVDS camEnabled field (the "Enable/Disable Camera" part action state)
+        if (_hullcamCamEnabledField != null)
+        {
+            try
+            {
+                var val = _hullcamCamEnabledField.GetValue(module);
+                if (val is bool b && !b) return true;
+            }
+            catch { }
+        }
+        // Check KSP's standard PartModule enable flags
+        var pm = module as PartModule;
+        if (pm != null && (!pm.isEnabled || !pm.moduleIsEnabled)) return true;
+        return false;
     }
 
     void ActivateHullCam(object module)
@@ -356,7 +381,7 @@ public partial class FastVesselChanger
         if (v != null)
         {
             foreach (var entry in GetHullCamsOnVessel(v))
-                if (_hullcamSelectedIds.Contains(entry.part.flightID))
+                if (!entry.disabled && _hullcamSelectedIds.Contains(entry.part.flightID))
                     _hullcamRotation.Add(entry.module);
         }
         if (_hullcamRotation.Count == 0)
@@ -604,9 +629,10 @@ public partial class FastVesselChanger
 
         var hcVessel = FlightGlobals.ActiveVessel;
         var hcVesselId = hcVessel?.id ?? Guid.Empty;
-        if (hcVesselId != _cachedVesselCamsId)
+        if (hcVesselId != _cachedVesselCamsId || Time.realtimeSinceStartup - _cachedVesselCamsTime > 2f)
         {
             _cachedVesselCamsId = hcVesselId;
+            _cachedVesselCamsTime = Time.realtimeSinceStartup;
             _cachedVesselCams = hcVessel != null ? GetHullCamsOnVessel(hcVessel) : new List<HullCamEntry>();
         }
         var vesselCams = _cachedVesselCams;
@@ -706,22 +732,42 @@ public partial class FastVesselChanger
             SaveToScenario();
         }
 
-        // Individual hull camera entries
-        foreach (var hce in vesselCams)
+        // Individual hull camera entries — enabled first, disabled sorted to bottom
+        var sortedCams = vesselCams.OrderBy(c => c.disabled ? 1 : 0).ToList();
+        bool disabledAutoUnchecked = false;
+        foreach (var hce in sortedCams)
         {
-            bool camSel = _hullcamSelectedIds.Contains(hce.part.flightID);
-            bool newCamSel = GUILayout.Toggle(camSel, "  " + GetHullCamDisplayName(hce.part, hce.module));
-            if (newCamSel != camSel)
+            if (hce.disabled)
             {
-                if (newCamSel) _hullcamSelectedIds.Add(hce.part.flightID);
-                else           _hullcamSelectedIds.Remove(hce.part.flightID);
-                if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] HullCam checkbox: '" + GetHullCamDisplayName(hce.part, hce.module)
-                    + "' flightID=" + hce.part.flightID + " selected=" + newCamSel
-                    + " (_hullcamSelectedIds.Count now=" + _hullcamSelectedIds.Count + ")");
-                RebuildHullCamRotation(hcVessel);
-                SyncCurrentHullcamStateToDict();
-                SaveToScenario();
+                // Auto-uncheck disabled cameras and remove from rotation
+                if (_hullcamSelectedIds.Remove(hce.part.flightID))
+                    disabledAutoUnchecked = true;
+                GUI.enabled = false;
+                GUILayout.Toggle(false, "  " + GetHullCamDisplayName(hce.part, hce.module) + "  [DISABLED]");
+                GUI.enabled = true;
             }
+            else
+            {
+                bool camSel = _hullcamSelectedIds.Contains(hce.part.flightID);
+                bool newCamSel = GUILayout.Toggle(camSel, "  " + GetHullCamDisplayName(hce.part, hce.module));
+                if (newCamSel != camSel)
+                {
+                    if (newCamSel) _hullcamSelectedIds.Add(hce.part.flightID);
+                    else           _hullcamSelectedIds.Remove(hce.part.flightID);
+                    if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] HullCam checkbox: '" + GetHullCamDisplayName(hce.part, hce.module)
+                        + "' flightID=" + hce.part.flightID + " selected=" + newCamSel
+                        + " (_hullcamSelectedIds.Count now=" + _hullcamSelectedIds.Count + ")");
+                    RebuildHullCamRotation(hcVessel);
+                    SyncCurrentHullcamStateToDict();
+                    SaveToScenario();
+                }
+            }
+        }
+        if (disabledAutoUnchecked)
+        {
+            RebuildHullCamRotation(hcVessel);
+            SyncCurrentHullcamStateToDict();
+            SaveToScenario();
         }
 
         GUILayout.EndScrollView();
