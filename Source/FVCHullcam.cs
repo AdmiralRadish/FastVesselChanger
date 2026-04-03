@@ -72,6 +72,10 @@ public partial class FastVesselChanger
         public float hullcamInterval = 10f;
         public bool includeExternal = true;
         public HashSet<uint> selectedFlightIds = new HashSet<uint>();
+        // Cameras the user disabled via the PAW right-click menu.  HullcamVDS
+        // does not persist camEnabled across FLIGHT→FLIGHT scene reloads in LMP,
+        // so FVC tracks and re-applies the disabled state after vessel switch.
+        public HashSet<uint> disabledFlightIds = new HashSet<uint>();
     }
 
     private struct HullCamEntry { public Part part; public object module; public bool disabled; }
@@ -458,9 +462,25 @@ public partial class FastVesselChanger
         s.hullcamInterval    = _hullcamInterval;
         s.includeExternal    = _hullcamIncludeExternal;
         s.selectedFlightIds  = new HashSet<uint>(_hullcamSelectedIds);
+
+        // Snapshot which cameras are currently disabled so we can re-apply
+        // the state after a vessel switch (HullcamVDS doesn't persist camEnabled
+        // across FLIGHT→FLIGHT in LMP).
+        var v = FlightGlobals.ActiveVessel;
+        if (v != null && v.id == _instanceVesselId)
+        {
+            s.disabledFlightIds.Clear();
+            foreach (var entry in GetHullCamsOnVessel(v))
+            {
+                if (entry.disabled)
+                    s.disabledFlightIds.Add(entry.part.flightID);
+            }
+        }
+
         if (VERBOSE_DIAGNOSTICS) Debug.Log("[FastVesselChanger] SyncCurrentHullcamStateToDict: vesselId=" + _instanceVesselId
             + " hullcamEnabled=" + s.hullcamEnabled
-            + " selectedCams=" + s.selectedFlightIds.Count);
+            + " selectedCams=" + s.selectedFlightIds.Count
+            + " disabledCams=" + s.disabledFlightIds.Count);
     }
 
     void ApplyVesselHullcamSettings(Vessel v)
@@ -498,6 +518,11 @@ public partial class FastVesselChanger
     /// </summary>
     void ActivateHullcamIfReady()
     {
+        // Re-apply disabled camera state from our persisted data.  HullcamVDS does
+        // not persist camEnabled across FLIGHT→FLIGHT in LMP, so we restore it here
+        // once parts are fully loaded.  This runs even when auto-cycling is off.
+        RestoreDisabledCameraState();
+
         if (!_hullcamInstalled || !_hullcamAutoActive || _hullcamRotation.Count == 0) return;
         var v = FlightGlobals.ActiveVessel;
         if (v == null) return;
@@ -518,6 +543,51 @@ public partial class FastVesselChanger
         // Clear the blackout overlay now that the hull cam (or external fallback)
         // is rendering — the stock FlightCamera flash is no longer visible.
         _pendingHullcamBlackout = false;
+    }
+
+    /// <summary>
+    /// Re-apply the disabled camera state that was tracked by FVC.
+    /// HullcamVDS's camEnabled [KSPField] doesn't survive FLIGHT→FLIGHT
+    /// scene reloads in LMP (the server overwrites the vessel with the
+    /// un-modified state).  FVC persists which cameras the user disabled
+    /// and re-disables them via reflection after each vessel switch.
+    /// </summary>
+    void RestoreDisabledCameraState()
+    {
+        if (!_hullcamInstalled || _hullcamCamEnabledField == null) return;
+        var v = FlightGlobals.ActiveVessel;
+        if (v == null) return;
+        VesselHullcamSettings s;
+        if (!_vesselHullcamSettings.TryGetValue(v.id, out s)) return;
+        if (s.disabledFlightIds.Count == 0) return;
+
+        int restored = 0;
+        foreach (var entry in GetHullCamsOnVessel(v))
+        {
+            if (!entry.disabled && s.disabledFlightIds.Contains(entry.part.flightID))
+            {
+                // Camera was disabled by user but lost its state — re-disable it
+                try
+                {
+                    _hullcamCamEnabledField.SetValue(entry.module, false);
+                    restored++;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[FastVesselChanger] RestoreDisabledCameraState: "
+                        + "failed to set camEnabled on flightID=" + entry.part.flightID
+                        + ": " + ex.Message);
+                }
+            }
+        }
+        if (restored > 0)
+        {
+            Debug.Log("[FastVesselChanger] RestoreDisabledCameraState: re-disabled "
+                + restored + " camera(s) on " + v.vesselName);
+            // Invalidate cache so the UI picks up the change
+            _cachedVesselCamsId = Guid.Empty;
+            RebuildHullCamRotation(v);
+        }
     }
 
     void LoadHullcamSettingsFromScenario(FastVesselChangerScenario scen)
@@ -634,6 +704,23 @@ public partial class FastVesselChanger
             _cachedVesselCamsId = hcVesselId;
             _cachedVesselCamsTime = Time.realtimeSinceStartup;
             _cachedVesselCams = hcVessel != null ? GetHullCamsOnVessel(hcVessel) : new List<HullCamEntry>();
+
+            // Silently rebuild rotation to pick up disabled-state changes
+            // from PAW toggles.  Unlike RebuildHullCamRotation(), this does
+            // NOT invalidate the cache we just refreshed.
+            if (_hullcamAutoActive)
+            {
+                _hullcamRotation.Clear();
+                if (_hullcamIncludeExternal)
+                    _hullcamRotation.Add(null);
+                foreach (var entry in _cachedVesselCams)
+                    if (!entry.disabled && _hullcamSelectedIds.Contains(entry.part.flightID))
+                        _hullcamRotation.Add(entry.module);
+                if (_hullcamRotation.Count == 0)
+                    _hullcamRotation.Add(null);
+                if (_hullcamRotationIndex >= _hullcamRotation.Count)
+                    _hullcamRotationIndex = 0;
+            }
         }
         var vesselCams = _cachedVesselCams;
         bool hcVisible = vesselCams.Count > 0;
@@ -688,6 +775,7 @@ public partial class FastVesselChanger
             }
             SyncCurrentHullcamStateToDict();
             SaveToScenario();
+            windowRect.height = 0; // force resize: countdown label appears/disappears
         }
         GUILayout.Label("Interval:", GUILayout.Width(52));
         string newHcText = GUILayout.TextField(_hullcamIntervalText, GUILayout.Width(40));
@@ -705,16 +793,15 @@ public partial class FastVesselChanger
         GUILayout.Label("s", GUILayout.Width(14));
         GUILayout.EndHorizontal();
 
-        // Always render the countdown label to keep a stable layout height.
-        // If this row appears/disappears when toggling ON/OFF, the scroll view
-        // controls below shift position and IMGUI can deliver a click to the wrong
-        // control (e.g. unchecking "External Camera" when the user only clicked ON).
+        // Countdown label — only shown when auto-cycling is ON.
+        // No placeholder needed when OFF: the ON/OFF button consumes the
+        // click event, so removing this row cannot misdeliver a click to
+        // the scroll view below.
+        if (_hullcamAutoActive)
         {
             float hcEffective = Mathf.Max(HULLCAM_MIN_INTERVAL, _hullcamInterval);
             float hcRemaining = Mathf.Max(0f, hcEffective - (Time.realtimeSinceStartup - _hullcamLastSwitchRealtime));
-            GUILayout.Label(_hullcamAutoActive
-                ? "Next camera in: " + hcRemaining.ToString("F0") + "s"
-                : " ",
+            GUILayout.Label("Next camera in: " + hcRemaining.ToString("F0") + "s",
                 GUILayout.Width(200));
         }
 
@@ -734,14 +821,16 @@ public partial class FastVesselChanger
 
         // Individual hull camera entries — enabled first, disabled sorted to bottom
         var sortedCams = vesselCams.OrderBy(c => c.disabled ? 1 : 0).ToList();
-        bool disabledAutoUnchecked = false;
         foreach (var hce in sortedCams)
         {
             if (hce.disabled)
             {
-                // Auto-uncheck disabled cameras and remove from rotation
-                if (_hullcamSelectedIds.Remove(hce.part.flightID))
-                    disabledAutoUnchecked = true;
+                // Show disabled cameras grayed-out at the bottom but DO NOT remove
+                // them from _hullcamSelectedIds.  RebuildHullCamRotation() already
+                // skips disabled cameras regardless of checked state, so keeping
+                // the selection preserves the user's choice: when the camera becomes
+                // enabled again (e.g. after a vessel switch reload) it is immediately
+                // included in the rotation without manual re-checking.
                 GUI.enabled = false;
                 GUILayout.Toggle(false, "  " + GetHullCamDisplayName(hce.part, hce.module) + "  [DISABLED]");
                 GUI.enabled = true;
@@ -762,12 +851,6 @@ public partial class FastVesselChanger
                     SaveToScenario();
                 }
             }
-        }
-        if (disabledAutoUnchecked)
-        {
-            RebuildHullCamRotation(hcVessel);
-            SyncCurrentHullcamStateToDict();
-            SaveToScenario();
         }
 
         GUILayout.EndScrollView();

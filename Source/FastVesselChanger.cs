@@ -94,9 +94,41 @@ public partial class FastVesselChanger : MonoBehaviour
     private static float _pendingZoom = 0f;
     private static bool _pendingZoomRestore = false;
     private static int _pendingZoomFramesRemaining = 0;
-    private const int ZOOM_RESTORE_FRAMES = 90; // ~1.5s at 60fps
+    private const int ZOOM_RESTORE_FRAMES = 35; // ~0.58s at 60fps (reduced from 45 to reduce zoom lockout duration)
     private static FieldInfo _camDistField = null;  // cached reflection handle for FlightCamera.distance
     private static bool _camDistFieldSearched = false; // true once we've attempted the lookup
+
+    // Per-vessel camera aim target — flightID of the Part the camera orbits around
+    private static Dictionary<Guid, uint> _vesselCameraTargets = new Dictionary<Guid, uint>();
+    private static uint _pendingCameraTarget = 0;
+    private static Guid _pendingCameraTargetVesselId = Guid.Empty;
+
+    // Per-vessel "Control From Here" reference — flightID of the control reference Part
+    // Uses its own frame counter (longer than zoom) because LMP continuously syncs
+    // referenceTransformId from the server, so the override must persist longer.
+    private static Dictionary<Guid, uint> _vesselControlFromHere = new Dictionary<Guid, uint>();
+    private static uint _pendingControlFromHere = 0;
+    private static Guid _pendingControlFromHereVesselId = Guid.Empty;
+    private static int _pendingControlFromHereFrames = 0;
+    private const int CONTROL_RESTORE_FRAMES = 180; // ~3s at 60fps — longer than zoom to outlast LMP syncs
+
+    /// <summary>
+    /// Properly applies "Control From Here" for any part type.
+    /// For docking ports, calls ModuleDockingNode.MakeReferenceTransform() so the
+    /// Part's reference direction is set to the docking axis (controlTransform)
+    /// before the vessel-level reference is updated.  Without this, the navball
+    /// uses the Part's default orientation instead of the docking direction.
+    /// For all other parts (command modules, etc.), falls back to
+    /// vessel.SetReferenceTransform(part) which is sufficient.
+    /// </summary>
+    private static void ApplyControlFromHere(Vessel vessel, Part controlPart)
+    {
+        var dockingNode = controlPart.FindModuleImplementing<ModuleDockingNode>();
+        if (dockingNode != null)
+            dockingNode.MakeReferenceTransform();
+        else
+            vessel.SetReferenceTransform(controlPart);
+    }
 
     // Hullcam blackout: draws a full-screen black overlay between scene start and
     // hullcam activation to hide the stock FlightCamera flash on vessels that have
@@ -158,6 +190,10 @@ public partial class FastVesselChanger : MonoBehaviour
     // Flight-ready gate: Update(), OnGUI(), and coroutines are passive until this is true.
     // Set by OnFlightReady() once the flight scene is fully initialized.
     private bool _flightReady = false;
+
+    // Set in OnDestroy to prevent SaveToScenario from snapshotting stale camera
+    // state during scene teardown.  SwitchToVessel already captured correct values.
+    private bool _isDestroying = false;
 
     // Diagnostic heartbeat — logs periodically so we can tell if the main thread is alive
     private float _lastHeartbeatRealtime = 0f;
@@ -491,6 +527,56 @@ public partial class FastVesselChanger : MonoBehaviour
                 }
             }
 
+            // Restore "Control From Here" for the active vessel.
+            // Also arm the frame-based re-application even for initial flight loads
+            // (not just FVC switches) so deferred KSP/LMP resets are overridden.
+            if (hullcamActiveVessel != null)
+            {
+                uint controlFlightId;
+                if (_vesselControlFromHere.TryGetValue(hullcamActiveVessel.id, out controlFlightId) && controlFlightId != 0)
+                {
+                    Part controlPart = hullcamActiveVessel.parts?.FirstOrDefault(p => p.flightID == controlFlightId);
+                    if (controlPart != null)
+                    {
+                        ApplyControlFromHere(hullcamActiveVessel, controlPart);
+                        Debug.Log("[FastVesselChanger] Restored Control From Here: " + controlPart.partInfo.title + " (flightID=" + controlFlightId + ") post-set refTransformId=" + hullcamActiveVessel.referenceTransformId);
+
+                        // Arm re-application if not already armed by SwitchToVessel
+                        if (_pendingControlFromHereFrames <= 0)
+                        {
+                            _pendingControlFromHere = controlFlightId;
+                            _pendingControlFromHereVesselId = hullcamActiveVessel.id;
+                            _pendingControlFromHereFrames = CONTROL_RESTORE_FRAMES;
+                            Debug.Log("[FastVesselChanger] Armed CFH re-application for initial load: " + CONTROL_RESTORE_FRAMES + " frames");
+                        }
+                    }
+                }
+
+                // Arm camera aim + zoom for initial load (SwitchToVessel sets
+                // these for FVC-triggered switches, but a fresh server join /
+                // scene load doesn't go through SwitchToVessel).
+                if (!_pendingZoomRestore)
+                {
+                    float savedZoom;
+                    if (_vesselZooms.TryGetValue(hullcamActiveVessel.id, out savedZoom))
+                    {
+                        _pendingZoomVesselId = hullcamActiveVessel.id;
+                        _pendingZoom = savedZoom;
+                        _pendingZoomRestore = true;
+                        _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
+                    }
+                }
+                if (_pendingCameraTarget == 0)
+                {
+                    uint savedCamTarget;
+                    if (_vesselCameraTargets.TryGetValue(hullcamActiveVessel.id, out savedCamTarget) && savedCamTarget != 0)
+                    {
+                        _pendingCameraTarget = savedCamTarget;
+                        _pendingCameraTargetVesselId = hullcamActiveVessel.id;
+                    }
+                }
+            }
+
             // Step 7: UI state sync
             Debug.Log("[FastVesselChanger] onFlightReady step 7: UI state");
             _staticUserPreferredUIVisible = userPreferredUIVisible;
@@ -507,13 +593,14 @@ public partial class FastVesselChanger : MonoBehaviour
                 _uiHideDeadlineRealtime = 0f;
             }
 
-            // Step 7b: Early zoom — apply pending zoom synchronously before any LateUpdate
-            // runs, giving the camera the correct distance as early as possible.  The
-            // end-of-frame coroutine will keep re-applying for ZOOM_RESTORE_FRAMES frames
-            // to fight any deferred SetTarget() calls.
+            // Step 7b: Early camera aim + zoom — apply synchronously before any
+            // LateUpdate runs.  Camera aim FIRST (since SetTargetPart resets distance),
+            // then zoom.  The end-of-frame coroutine re-applies all three (aim, zoom,
+            // control-from-here) every frame for ZOOM_RESTORE_FRAMES frames to fight
+            // KSP's deferred scene init.
             // Skip when a hullcam was just activated — hullcam has its own camera,
             // and forcing flight camera zoom would interfere.
-            if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && !hullcamActivatedEarly)
+            if (!hullcamActivatedEarly)
             {
                 var cam = FlightCamera.fetch;
                 if (cam != null)
@@ -524,9 +611,29 @@ public partial class FastVesselChanger : MonoBehaviour
                         _camDistField = cam.GetType().GetField("distance",
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     }
-                    cam.SetDistanceImmediate(_pendingZoom);
-                    _camDistField?.SetValue(cam, _pendingZoom);
-                    Debug.Log("[FastVesselChanger] Early zoom applied in onFlightReady: " + _pendingZoom);
+
+                    // Camera aim target first
+                    if (_pendingCameraTarget != 0 && _pendingCameraTargetVesselId != Guid.Empty)
+                    {
+                        var aimVessel = FlightGlobals.ActiveVessel;
+                        if (aimVessel != null)
+                        {
+                            Part targetPart = aimVessel.parts?.FirstOrDefault(p => p.flightID == _pendingCameraTarget);
+                            if (targetPart != null)
+                            {
+                                cam.SetTargetPart(targetPart);
+                                Debug.Log("[FastVesselChanger] Early camera aim applied in onFlightReady: " + targetPart.partName + " (flightID=" + _pendingCameraTarget + ")");
+                            }
+                        }
+                    }
+
+                    // Then zoom (SetTargetPart resets distance)
+                    if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty)
+                    {
+                        cam.SetDistanceImmediate(_pendingZoom);
+                        _camDistField?.SetValue(cam, _pendingZoom);
+                        Debug.Log("[FastVesselChanger] Early zoom applied in onFlightReady: " + _pendingZoom);
+                    }
                 }
             }
 
@@ -707,10 +814,10 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void LateUpdate()
     {
-        // Pre-render zoom restore: override any FlightCamera.SetTarget() calls that
-        // fired during Update/coroutine phase this frame.  LateUpdate runs BEFORE
-        // the frame is rendered (unlike WaitForEndOfFrame which runs AFTER), so the
-        // user never sees a frame at the wrong zoom.
+        // Pre-render restore: override any FlightCamera.SetTarget() / reference
+        // transform resets that fired during Update/coroutine phase this frame.
+        // LateUpdate runs BEFORE the frame is rendered, so the user never sees a
+        // frame at the wrong zoom, camera target, or control reference.
         // Frame countdown is managed by ApplyPitchOverridesEndOfFrame; this just applies.
         if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && _pendingZoomFramesRemaining > 0)
         {
@@ -726,9 +833,32 @@ public partial class FastVesselChanger : MonoBehaviour
                         _camDistField = cam.GetType().GetField("distance",
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     }
+
+                    // Camera aim target first (SetTargetPart resets distance)
+                    if (_pendingCameraTarget != 0 && _pendingCameraTargetVesselId == activeVessel.id)
+                    {
+                        Part targetPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingCameraTarget);
+                        if (targetPart != null)
+                            cam.SetTargetPart(targetPart);
+                    }
+
+                    // Zoom
                     cam.SetDistanceImmediate(_pendingZoom);
                     _camDistField?.SetValue(cam, _pendingZoom);
                 }
+            }
+        }
+
+        // Control From Here — uses its own longer countdown (CONTROL_RESTORE_FRAMES)
+        // because LMP continuously syncs referenceTransformId from the server.
+        if (_pendingControlFromHere != 0 && _pendingControlFromHereFrames > 0)
+        {
+            var activeVessel = FlightGlobals.ActiveVessel;
+            if (activeVessel != null && activeVessel.id == _pendingControlFromHereVesselId)
+            {
+                Part controlPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingControlFromHere);
+                if (controlPart != null)
+                    ApplyControlFromHere(activeVessel, controlPart);
             }
         }
 
@@ -772,11 +902,10 @@ public partial class FastVesselChanger : MonoBehaviour
             if (cameraRotEnabled && cameraRotXRate != 0f)
                 cam.camPitch += cameraRotXRate * Mathf.Deg2Rad * Time.deltaTime;
 
-            // Zoom restore — applied every end-of-frame for ZOOM_RESTORE_FRAMES frames.
-            // KSP's FlightCamera.SetTarget() is called asynchronously during scene init
-            // and can fire several frames AFTER onFlightReady, resetting `distance` to
-            // the vessel's default.  By re-applying every frame for ~1.5s, we guarantee
-            // our saved zoom overrides any deferred camera setup.
+            // Zoom + camera aim restore — applied every end-of-frame for
+            // ZOOM_RESTORE_FRAMES frames.  KSP's deferred scene init (FlightCamera.
+            // SetTarget()) fires several frames AFTER onFlightReady, resetting both.
+            // Re-applying every frame guarantees our saved state overrides KSP's defaults.
             if (_pendingZoomRestore && _pendingZoomVesselId != Guid.Empty && _pendingZoomFramesRemaining > 0)
             {
                 var activeVessel = FlightGlobals.ActiveVessel;
@@ -790,6 +919,15 @@ public partial class FastVesselChanger : MonoBehaviour
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     }
 
+                    // Camera aim target (before zoom, since SetTargetPart resets distance)
+                    if (_pendingCameraTarget != 0 && _pendingCameraTargetVesselId == activeVessel.id)
+                    {
+                        Part targetPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingCameraTarget);
+                        if (targetPart != null)
+                            cam.SetTargetPart(targetPart);
+                    }
+
+                    // Zoom
                     cam.SetDistanceImmediate(_pendingZoom);
                     _camDistField?.SetValue(cam, _pendingZoom);
 
@@ -798,8 +936,37 @@ public partial class FastVesselChanger : MonoBehaviour
                     {
                         _pendingZoomVesselId = Guid.Empty;
                         _pendingZoomRestore = false;
-                        VerboseLog("[FastVesselChanger] RestoreZoom complete after " + ZOOM_RESTORE_FRAMES + " frames: final=" + cam.Distance);
+                        _pendingCameraTarget = 0;
+                        _pendingCameraTargetVesselId = Guid.Empty;
+                        VerboseLog("[FastVesselChanger] Zoom/aim restore complete after " + ZOOM_RESTORE_FRAMES + " frames: zoom=" + cam.Distance);
                     }
+                }
+            }
+
+            // Control From Here restore — own countdown (CONTROL_RESTORE_FRAMES)
+            // because LMP continuously syncs referenceTransformId from the server,
+            // so the override must persist longer than the camera/zoom window.
+            if (_pendingControlFromHere != 0 && _pendingControlFromHereFrames > 0)
+            {
+                var activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null && activeVessel.id == _pendingControlFromHereVesselId)
+                {
+                    Part controlPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingControlFromHere);
+                    if (controlPart != null)
+                    {
+                        ApplyControlFromHere(activeVessel, controlPart);
+                        if (_pendingControlFromHereFrames == CONTROL_RESTORE_FRAMES)
+                            Debug.Log("[FastVesselChanger] CFH coroutine: first-frame apply flightID=" + _pendingControlFromHere + " refTransformId=" + activeVessel.referenceTransformId);
+                    }
+                }
+
+                _pendingControlFromHereFrames--;
+                if (_pendingControlFromHereFrames <= 0)
+                {
+                    _pendingControlFromHere = 0;
+                    _pendingControlFromHereVesselId = Guid.Empty;
+                    if (activeVessel != null)
+                        Debug.Log("[FastVesselChanger] CFH restore complete after " + CONTROL_RESTORE_FRAMES + " frames, final refTransformId=" + activeVessel.referenceTransformId);
                 }
             }
 
@@ -1537,6 +1704,26 @@ public partial class FastVesselChanger : MonoBehaviour
             {
                 VerboseLog("[FastVesselChanger] Could not capture zoom before switch: FlightCamera.fetch is null or hull cam active", warning: true);
             }
+
+            // Save camera aim target (which Part the camera orbits around)
+            if (cam != null && cam.Target != null && _hullcamLastActivatedModule == null)
+            {
+                var aimPart = cam.Target.GetComponentInParent<Part>();
+                if (aimPart != null && aimPart.flightID != 0)
+                    _vesselCameraTargets[currentVessel.id] = aimPart.flightID;
+            }
+
+            // Save "Control From Here" — use referenceTransformId directly
+            // (more reliable than the ReferenceTransform→Part→flightID chain).
+            uint switchRefId = currentVessel.referenceTransformId;
+            if (switchRefId != 0)
+            {
+                _vesselControlFromHere[currentVessel.id] = switchRefId;
+                var refPart = currentVessel.parts?.FirstOrDefault(p => p.flightID == switchRefId);
+                Debug.Log("[FastVesselChanger] CFH capture on switch-away: vessel=" + currentVessel.vesselName
+                    + " refTransformId=" + switchRefId
+                    + " partName=" + (refPart != null ? refPart.partInfo.title : "NOT_FOUND"));
+            }
         }
 
         // Save hull cam state for the vessel we're leaving.
@@ -1649,6 +1836,34 @@ public partial class FastVesselChanger : MonoBehaviour
             _pendingZoomRestore = true;
             _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
             VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + savedZoom);
+        }
+
+        // Queue camera aim target restore
+        uint savedCamTarget;
+        if (_vesselCameraTargets.TryGetValue(v.id, out savedCamTarget) && savedCamTarget != 0)
+        {
+            _pendingCameraTarget = savedCamTarget;
+            _pendingCameraTargetVesselId = v.id;
+        }
+        else
+        {
+            _pendingCameraTarget = 0;
+            _pendingCameraTargetVesselId = Guid.Empty;
+        }
+
+        // Queue control-from-here restore
+        uint savedControl;
+        if (_vesselControlFromHere.TryGetValue(v.id, out savedControl) && savedControl != 0)
+        {
+            _pendingControlFromHere = savedControl;
+            _pendingControlFromHereVesselId = v.id;
+            _pendingControlFromHereFrames = CONTROL_RESTORE_FRAMES;
+        }
+        else
+        {
+            _pendingControlFromHere = 0;
+            _pendingControlFromHereVesselId = Guid.Empty;
+            _pendingControlFromHereFrames = 0;
         }
 
         // Randomize camera rotation rates if enabled
@@ -1790,6 +2005,36 @@ public partial class FastVesselChanger : MonoBehaviour
                 }
             }
 
+            // Per-vessel camera aim targets
+            XmlElement camTargetsNode = playerSection["VesselCameraTargets"];
+            if (camTargetsNode != null)
+            {
+                _vesselCameraTargets.Clear();
+                foreach (XmlElement t in camTargetsNode.GetElementsByTagName("Target"))
+                {
+                    Guid vesselId;
+                    uint flightId;
+                    if (!Guid.TryParse(t.GetAttribute("vessel"), out vesselId)) continue;
+                    if (!uint.TryParse(t.GetAttribute("flightId"), out flightId)) continue;
+                    _vesselCameraTargets[vesselId] = flightId;
+                }
+            }
+
+            // Per-vessel control-from-here references
+            XmlElement controlNode = playerSection["VesselControlFromHere"];
+            if (controlNode != null)
+            {
+                _vesselControlFromHere.Clear();
+                foreach (XmlElement c in controlNode.GetElementsByTagName("Control"))
+                {
+                    Guid vesselId;
+                    uint flightId;
+                    if (!Guid.TryParse(c.GetAttribute("vessel"), out vesselId)) continue;
+                    if (!uint.TryParse(c.GetAttribute("flightId"), out flightId)) continue;
+                    _vesselControlFromHere[vesselId] = flightId;
+                }
+            }
+
             // Per-vessel switch intervals
             XmlElement intervalsNode = playerSection["VesselSwitchIntervals"];
             if (intervalsNode != null)
@@ -1834,6 +2079,12 @@ public partial class FastVesselChanger : MonoBehaviour
                         uint fid;
                         if (uint.TryParse(cam.GetAttribute("flightId"), out fid))
                             s.selectedFlightIds.Add(fid);
+                    }
+                    foreach (XmlElement dis in hc.GetElementsByTagName("DisabledCam"))
+                    {
+                        uint fid;
+                        if (uint.TryParse(dis.GetAttribute("flightId"), out fid))
+                            s.disabledFlightIds.Add(fid);
                     }
                     _vesselHullcamSettings[vesselId] = s;
                 }
@@ -1976,6 +2227,30 @@ public partial class FastVesselChanger : MonoBehaviour
             }
             playerSection.AppendChild(zoomsNode);
 
+            // Per-vessel camera aim targets
+            XmlElement camTargetsNode = doc.CreateElement("VesselCameraTargets");
+            foreach (var kvCam in _vesselCameraTargets)
+            {
+                if (kvCam.Value == 0) continue;
+                XmlElement t = doc.CreateElement("Target");
+                t.SetAttribute("vessel", kvCam.Key.ToString());
+                t.SetAttribute("flightId", kvCam.Value.ToString());
+                camTargetsNode.AppendChild(t);
+            }
+            playerSection.AppendChild(camTargetsNode);
+
+            // Per-vessel control-from-here references
+            XmlElement controlNode = doc.CreateElement("VesselControlFromHere");
+            foreach (var kvCtrl in _vesselControlFromHere)
+            {
+                if (kvCtrl.Value == 0) continue;
+                XmlElement c = doc.CreateElement("Control");
+                c.SetAttribute("vessel", kvCtrl.Key.ToString());
+                c.SetAttribute("flightId", kvCtrl.Value.ToString());
+                controlNode.AppendChild(c);
+            }
+            playerSection.AppendChild(controlNode);
+
             // Per-vessel hullcam settings
             SyncCurrentHullcamStateToDict();
             XmlElement hullcamsNode = doc.CreateElement("HullcamSettings");
@@ -1992,6 +2267,12 @@ public partial class FastVesselChanger : MonoBehaviour
                     XmlElement cam = doc.CreateElement("SelectedCam");
                     cam.SetAttribute("flightId", fid.ToString());
                     hc.AppendChild(cam);
+                }
+                foreach (var fid in hs.disabledFlightIds)
+                {
+                    XmlElement dis = doc.CreateElement("DisabledCam");
+                    dis.SetAttribute("flightId", fid.ToString());
+                    hc.AppendChild(dis);
                 }
                 hullcamsNode.AppendChild(hc);
             }
@@ -2055,11 +2336,54 @@ public partial class FastVesselChanger : MonoBehaviour
             // FLIGHT\u2192FLIGHT reload (including OnDestroy) cam.Distance is
             // stale/default, so snapshotting would overwrite the correct value
             // that SwitchToVessel already placed in the dict.
-            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0)
+            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0 && !_isDestroying)
             {
                 var cam = FlightCamera.fetch;
                 if (cam != null && _hullcamLastActivatedModule == null)
                     _vesselZooms[_instanceVesselId] = cam.Distance;
+            }
+
+            // Snapshot camera aim target for current vessel.
+            // SKIP during FLIGHT\u2192FLIGHT reload (pendingZoomFramesRemaining > 0):
+            // ActiveVessel is already the NEW vessel at that point, so reading its
+            // camera target would overwrite the OLD vessel's correct value that
+            // SwitchToVessel already captured.
+            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0 && !_isDestroying)
+            {
+                var av = FlightGlobals.ActiveVessel;
+                if (av != null)
+                {
+                    var cam = FlightCamera.fetch;
+                    if (cam != null && cam.Target != null && _hullcamLastActivatedModule == null)
+                    {
+                        var aimPart = cam.Target.GetComponentInParent<Part>();
+                        if (aimPart != null && aimPart.flightID != 0)
+                            _vesselCameraTargets[_instanceVesselId] = aimPart.flightID;
+                    }
+                }
+            }
+
+            // Snapshot control-from-here reference for current vessel.
+            // Uses referenceTransformId directly (more reliable than Part lookup).
+            // Uses its own guard (_pendingControlFromHereFrames) since it has a
+            // longer restore window than zoom/camera aim.
+            if (_instanceVesselId != Guid.Empty && _pendingControlFromHereFrames <= 0)
+            {
+                var av = FlightGlobals.ActiveVessel;
+                if (av != null)
+                {
+                    uint refId = av.referenceTransformId;
+                    if (refId != 0)
+                    {
+                        _vesselControlFromHere[_instanceVesselId] = refId;
+                        Debug.Log("[FastVesselChanger] CFH snapshot in SaveToScenario: vessel=" + av.vesselName
+                            + " refTransformId=" + refId);
+                    }
+                }
+            }
+            else if (_instanceVesselId != Guid.Empty && _pendingControlFromHereFrames > 0)
+            {
+                Debug.Log("[FastVesselChanger] CFH snapshot SKIPPED (pendingFrames=" + _pendingControlFromHereFrames + ")");
             }
 
             // Sync active vessel's hull cam state to the dict before serializing
@@ -2351,6 +2675,7 @@ public partial class FastVesselChanger : MonoBehaviour
         if (_hullcamInstalled)
             SyncCurrentHullcamStateToDict();
 
+        _isDestroying = true; // Signal SaveToScenario to skip camera snapshots
         SaveToScenario(); // Save state before destroying
 
         // Deactivate hull cam AFTER save so the zoom guard works, but before the
