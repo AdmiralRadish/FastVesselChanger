@@ -834,6 +834,18 @@ public partial class FastVesselChanger : MonoBehaviour
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     }
 
+                    // On the very first restore frame, clamp an unreasonably large saved zoom
+                    // to cam.startDistance.  This prevents a vessel loading EXTREMELY zoomed out
+                    // when the zoom was captured during scene init before the camera settled.
+                    if (_pendingZoomFramesRemaining == ZOOM_RESTORE_FRAMES
+                        && cam.startDistance > 0f && _pendingZoom > cam.startDistance * 10f)
+                    {
+                        Debug.Log(string.Format("[FastVesselChanger] Zoom restore clamped: {0:F0} → {1:F0} (startDist={2:F0})",
+                            _pendingZoom, cam.startDistance, cam.startDistance));
+                        _pendingZoom = cam.startDistance;
+                        _vesselZooms[activeVessel.id] = _pendingZoom; // overwrite the bad saved value
+                    }
+
                     // Camera aim target first (SetTargetPart resets distance)
                     if (_pendingCameraTarget != 0 && _pendingCameraTargetVesselId == activeVessel.id)
                     {
@@ -917,6 +929,14 @@ public partial class FastVesselChanger : MonoBehaviour
                         _camDistFieldSearched = true;
                         _camDistField = cam.GetType().GetField("distance",
                             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    }
+
+                    // First-frame clamp (belt-and-suspenders alongside the Update() check).
+                    if (_pendingZoomFramesRemaining == ZOOM_RESTORE_FRAMES
+                        && cam.startDistance > 0f && _pendingZoom > cam.startDistance * 10f)
+                    {
+                        _pendingZoom = cam.startDistance;
+                        _vesselZooms[activeVessel.id] = _pendingZoom;
                     }
 
                     // Camera aim target (before zoom, since SetTargetPart resets distance)
@@ -1697,8 +1717,15 @@ public partial class FastVesselChanger : MonoBehaviour
             // If a hull cam is active, cam.Distance is meaningless (hull cam mount, not orbit distance).
             if (cam != null && _hullcamLastActivatedModule == null)
             {
-                _vesselZooms[currentVessel.id] = cam.Distance;
-                VerboseLog("[FastVesselChanger] Captured zoom before switch: vessel=" + currentVessel.vesselName + " id=" + currentVessel.id + " zoom=" + cam.Distance);
+                float zoomToSave = cam.Distance;
+                if (cam.startDistance > 0f && zoomToSave > cam.startDistance * 10f)
+                {
+                    Debug.Log(string.Format("[FastVesselChanger] Zoom capture clamped: {0:F0} → {1:F0} (startDist={2:F0})",
+                        zoomToSave, cam.startDistance, cam.startDistance));
+                    zoomToSave = cam.startDistance;
+                }
+                _vesselZooms[currentVessel.id] = zoomToSave;
+                VerboseLog("[FastVesselChanger] Captured zoom before switch: vessel=" + currentVessel.vesselName + " id=" + currentVessel.id + " zoom=" + zoomToSave);
             }
             else
             {
@@ -2340,7 +2367,16 @@ public partial class FastVesselChanger : MonoBehaviour
             {
                 var cam = FlightCamera.fetch;
                 if (cam != null && _hullcamLastActivatedModule == null)
-                    _vesselZooms[_instanceVesselId] = cam.Distance;
+                {
+                    float zoomToSave = cam.Distance;
+                    if (cam.startDistance > 0f && zoomToSave > cam.startDistance * 10f)
+                    {
+                        Debug.Log(string.Format("[FastVesselChanger] Zoom snapshot clamped: {0:F0} → {1:F0} (startDist={2:F0})",
+                            zoomToSave, cam.startDistance, cam.startDistance));
+                        zoomToSave = cam.startDistance;
+                    }
+                    _vesselZooms[_instanceVesselId] = zoomToSave;
+                }
             }
 
             // Snapshot camera aim target for current vessel.

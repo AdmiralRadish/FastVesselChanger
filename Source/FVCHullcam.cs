@@ -466,11 +466,33 @@ public partial class FastVesselChanger
         // Snapshot which cameras are currently disabled so we can re-apply
         // the state after a vessel switch (HullcamVDS doesn't persist camEnabled
         // across FLIGHT→FLIGHT in LMP).
-        var v = FlightGlobals.ActiveVessel;
-        if (v != null && v.id == _instanceVesselId)
+        //
+        // Do NOT rely solely on FlightGlobals.ActiveVessel: during a user-initiated
+        // (non-FVC) vessel switch, OnDestroy() fires after FlightGlobals.ActiveVessel
+        // has already changed to the new vessel.  Search FlightGlobals.Vessels by
+        // GUID instead — the old vessel's parts are still alive at OnDestroy time.
+        Vessel syncVessel = null;
+        if (FlightGlobals.ActiveVessel?.id == _instanceVesselId)
+        {
+            syncVessel = FlightGlobals.ActiveVessel;
+        }
+        else
+        {
+            var allVessels = FlightGlobals.Vessels;
+            if (allVessels != null)
+            {
+                for (int _vi = 0; _vi < allVessels.Count; _vi++)
+                {
+                    var _fv = allVessels[_vi];
+                    if (_fv != null && _fv.id == _instanceVesselId) { syncVessel = _fv; break; }
+                }
+            }
+        }
+
+        if (syncVessel != null)
         {
             s.disabledFlightIds.Clear();
-            foreach (var entry in GetHullCamsOnVessel(v))
+            foreach (var entry in GetHullCamsOnVessel(syncVessel))
             {
                 if (entry.disabled)
                     s.disabledFlightIds.Add(entry.part.flightID);
