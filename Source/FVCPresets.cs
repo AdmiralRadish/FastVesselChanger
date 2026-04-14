@@ -116,7 +116,7 @@ public partial class FastVesselChanger
         var cam = FlightCamera.fetch;
         var av = FlightGlobals.ActiveVessel;
         if (cam != null && av != null && _hullcamLastActivatedModule == null)
-            _vesselZooms[av.id] = cam.Distance;
+            GetOrCreateVesselSettings(av.id).cameraZoom = cam.Distance;
 
         _presets[index].Clear();
         foreach (var kv in selected)
@@ -125,19 +125,19 @@ public partial class FastVesselChanger
             var d = new PresetVesselData { vesselId = kv.Key };
 
             // Zoom
-            float zoom;
-            if (_vesselZooms.TryGetValue(kv.Key, out zoom))
-                d.zoom = zoom;
+            VesselSettings pvs;
+            _vesselSettings.TryGetValue(kv.Key, out pvs);
+            if (pvs != null && !float.IsNaN(pvs.cameraZoom))
+                d.zoom = pvs.cameraZoom;
 
             // Switch interval
-            int interval;
-            if (_vesselSwitchIntervals.TryGetValue(kv.Key, out interval))
-                d.switchInterval = interval;
+            if (pvs != null && pvs.switchInterval != 0)
+                d.switchInterval = pvs.switchInterval;
 
             // Hullcam settings
-            VesselHullcamSettings hcs;
-            if (_vesselHullcamSettings.TryGetValue(kv.Key, out hcs))
+            if (pvs != null && pvs.hullcam != null)
             {
+                var hcs = pvs.hullcam;
                 d.hullcamEnabled = hcs.hullcamEnabled;
                 d.hullcamInterval = hcs.hullcamInterval;
                 d.hullcamIncludeExternal = hcs.includeExternal;
@@ -199,19 +199,14 @@ public partial class FastVesselChanger
     {
         // Zoom
         if (d.zoom >= 0f)
-            _vesselZooms[d.vesselId] = d.zoom;
+            GetOrCreateVesselSettings(d.vesselId).cameraZoom = d.zoom;
 
         // Switch interval
         if (d.switchInterval >= 0)
-            _vesselSwitchIntervals[d.vesselId] = d.switchInterval;
+            GetOrCreateVesselSettings(d.vesselId).switchInterval = d.switchInterval;
 
         // Hullcam settings
-        VesselHullcamSettings hcs;
-        if (!_vesselHullcamSettings.TryGetValue(d.vesselId, out hcs))
-        {
-            hcs = new VesselHullcamSettings();
-            _vesselHullcamSettings[d.vesselId] = hcs;
-        }
+        var hcs = GetOrCreateHullcam(d.vesselId);
         hcs.hullcamEnabled = d.hullcamEnabled;
         hcs.hullcamInterval = d.hullcamInterval;
         hcs.includeExternal = d.hullcamIncludeExternal;

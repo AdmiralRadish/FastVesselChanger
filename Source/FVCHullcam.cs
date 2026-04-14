@@ -29,8 +29,7 @@ public partial class FastVesselChanger
     private static FieldInfo _hullcamIsActiveField = null;
     private static FieldInfo _hullcamCameraNameField = null;
     private static FieldInfo _hullcamCamEnabledField = null;
-    // Per-vessel hull cam settings (static, survives vessel-switch addon recreation like _vesselZooms)
-    private static Dictionary<Guid, VesselHullcamSettings> _vesselHullcamSettings = new Dictionary<Guid, VesselHullcamSettings>();
+    // Per-vessel hull cam settings: now stored inside _vesselSettings (see FVCVesselSettings.cs)
 
     // Cached hull cam list for the active vessel — avoids re-scanning parts every OnGUI call.
     // Invalidated when vessel changes (checked via ID) or when RebuildHullCamRotation is called.
@@ -277,7 +276,7 @@ public partial class FastVesselChanger
             {
                 var fc = FlightCamera.fetch;
                 if (fc != null)
-                    _vesselZooms[_instanceVesselId] = fc.Distance;
+                    GetOrCreateVesselSettings(_instanceVesselId).cameraZoom = fc.Distance;
             }
 
             // Guard against stale camActive state — HullcamVDS's ActivateCamera() is a
@@ -400,8 +399,9 @@ public partial class FastVesselChanger
     void RestoreZoomAfterHullcamDeactivate()
     {
         if (_instanceVesselId == Guid.Empty) return;
-        float savedZoom;
-        if (!_vesselZooms.TryGetValue(_instanceVesselId, out savedZoom)) return;
+        VesselSettings rz;
+        if (!_vesselSettings.TryGetValue(_instanceVesselId, out rz) || float.IsNaN(rz.cameraZoom)) return;
+        float savedZoom = rz.cameraZoom;
         var cam = FlightCamera.fetch;
         if (cam == null) return;
 
@@ -443,16 +443,7 @@ public partial class FastVesselChanger
         }
     }
 
-    VesselHullcamSettings GetOrCreateHullcamSettings(Guid vesselId)
-    {
-        VesselHullcamSettings s;
-        if (!_vesselHullcamSettings.TryGetValue(vesselId, out s))
-        {
-            s = new VesselHullcamSettings();
-            _vesselHullcamSettings[vesselId] = s;
-        }
-        return s;
-    }
+    VesselHullcamSettings GetOrCreateHullcamSettings(Guid vesselId) => GetOrCreateHullcam(vesselId);
 
     void SyncCurrentHullcamStateToDict()
     {
@@ -517,7 +508,7 @@ public partial class FastVesselChanger
             + " interval=" + s.hullcamInterval
             + " includeExternal=" + s.includeExternal
             + " selectedCams=" + s.selectedFlightIds.Count
-            + " (dictEntries=" + _vesselHullcamSettings.Count + ")");
+            + " (dictEntries=" + _vesselSettings.Count + ")");
         _hullcamAutoActive      = s.hullcamEnabled;
         _hullcamInterval        = Mathf.Max(HULLCAM_MIN_INTERVAL, s.hullcamInterval);
         _hullcamIntervalText    = _hullcamInterval.ToString("F0");
@@ -579,8 +570,9 @@ public partial class FastVesselChanger
         if (!_hullcamInstalled || _hullcamCamEnabledField == null) return;
         var v = FlightGlobals.ActiveVessel;
         if (v == null) return;
-        VesselHullcamSettings s;
-        if (!_vesselHullcamSettings.TryGetValue(v.id, out s)) return;
+        VesselSettings rvs;
+        if (!_vesselSettings.TryGetValue(v.id, out rvs) || rvs.hullcam == null) return;
+        var s = rvs.hullcam;
         if (s.disabledFlightIds.Count == 0) return;
 
         int restored = 0;
@@ -620,12 +612,11 @@ public partial class FastVesselChanger
         if (scen == null)
         {
             Debug.Log("[FastVesselChanger] LoadHullcamSettingsFromScenario: scenario null, keeping "
-                + _vesselHullcamSettings.Count + " existing entries");
+                + _vesselSettings.Count + " existing entries");
             return;
         }
         Debug.Log("[FastVesselChanger] LoadHullcamSettingsFromScenario: scenario has entries="
             + scen.vesselHullcamEntries.Count + " cams=" + scen.vesselHullcamSelectedCams.Count);
-        _vesselHullcamSettings.Clear();
         // format: "guid|hullcamEnabled|interval|includeExternal"
         foreach (var entry in scen.vesselHullcamEntries)
         {
@@ -633,11 +624,10 @@ public partial class FastVesselChanger
             if (parts.Length < 4) continue;
             Guid vesselId;
             if (!Guid.TryParse(parts[0], out vesselId)) continue;
-            var s = new VesselHullcamSettings();
+            var s = GetOrCreateHullcam(vesselId);
             bool enabled = false;  bool.TryParse(parts[1], out enabled);  s.hullcamEnabled = enabled;
             float interval = 10f;  float.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out interval);  s.hullcamInterval = Mathf.Max(1f, interval);
             bool incExt = true;    bool.TryParse(parts[3], out incExt);   s.includeExternal = incExt;
-            _vesselHullcamSettings[vesselId] = s;
         }
         // format: "guid|flightId"
         foreach (var entry in scen.vesselHullcamSelectedCams)
@@ -648,13 +638,7 @@ public partial class FastVesselChanger
             if (!Guid.TryParse(parts[0], out vesselId)) continue;
             uint flightId;
             if (!uint.TryParse(parts[1], out flightId)) continue;
-            VesselHullcamSettings s;
-            if (!_vesselHullcamSettings.TryGetValue(vesselId, out s))
-            {
-                s = new VesselHullcamSettings();
-                _vesselHullcamSettings[vesselId] = s;
-            }
-            s.selectedFlightIds.Add(flightId);
+            GetOrCreateHullcam(vesselId).selectedFlightIds.Add(flightId);
         }
     }
 

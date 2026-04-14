@@ -38,8 +38,10 @@ public partial class FastVesselChanger : MonoBehaviour
     private bool _lastShowPresets = false; // Track preset section state for height recalc
     private string vesselSearchText = ""; // Live search filter for vessel list
 
-    // Lazy-initialized GUIStyle for current vessel label (bold + slightly larger)
-    private GUIStyle _currentVesselStyle = null;
+    // Lazy-initialized GUIStyles for vessel list display
+    private GUIStyle _currentVesselStyle   = null;
+    private GUIStyle _activeVesselRowStyle = null;  // bold + gold for active vessel in list
+    private GUIStyle _vesselTypeStyle      = null;  // small right-aligned dim type label
 
     private Dictionary<Guid, bool> selected = new Dictionary<Guid, bool>();
     private Dictionary<string, bool> vesselTypeFilter = new Dictionary<string, bool>(); // Vessel type filtering
@@ -83,11 +85,8 @@ public partial class FastVesselChanger : MonoBehaviour
     // Shuffle bag IDs loaded from XML, resolved against cycleList in RestoreShuffleBag
     private static List<string> _loadedShuffleBagIds = new List<string>();
 
-    // Per-vessel auto-switch intervals — keyed by vessel ID, survives vessel switches within a session
-    private static Dictionary<Guid, int> _vesselSwitchIntervals = new Dictionary<Guid, int>();
+    // Per-vessel settings: see FVCVesselSettings.cs (_vesselSettings + VesselSettings class)
 
-    // Per-vessel zoom levels — keyed by vessel ID, survives vessel switches within a session
-    private static Dictionary<Guid, float> _vesselZooms = new Dictionary<Guid, float>();
     // Pending zoom — applied every end-of-frame for multiple frames to override deferred
     // FlightCamera.SetTarget() calls that fire after onFlightReady.
     private static Guid _pendingZoomVesselId = Guid.Empty;
@@ -99,14 +98,12 @@ public partial class FastVesselChanger : MonoBehaviour
     private static bool _camDistFieldSearched = false; // true once we've attempted the lookup
 
     // Per-vessel camera aim target — flightID of the Part the camera orbits around
-    private static Dictionary<Guid, uint> _vesselCameraTargets = new Dictionary<Guid, uint>();
     private static uint _pendingCameraTarget = 0;
     private static Guid _pendingCameraTargetVesselId = Guid.Empty;
 
     // Per-vessel "Control From Here" reference — flightID of the control reference Part
     // Uses its own frame counter (longer than zoom) because LMP continuously syncs
     // referenceTransformId from the server, so the override must persist longer.
-    private static Dictionary<Guid, uint> _vesselControlFromHere = new Dictionary<Guid, uint>();
     private static uint _pendingControlFromHere = 0;
     private static Guid _pendingControlFromHereVesselId = Guid.Empty;
     private static int _pendingControlFromHereFrames = 0;
@@ -381,6 +378,20 @@ public partial class FastVesselChanger : MonoBehaviour
         var inst = GetUIMasterInstance();
         if (inst != null && _uiHideMethod != null)
         {
+            // Skip the call if the UI is already hidden — avoids KSP logging
+            // "[UIMasterController]: HideUI" on every LateUpdate frame while the
+            // hide deadline is active (~60 entries/sec → ~988 entries per scene load).
+            // isUIShowing == false means HUD is already hidden; calling HideUI again
+            // would be a no-op visually but still logs and fires onHideUI.
+            if (_uiQuickHideField != null)
+            {
+                try
+                {
+                    bool isShowing = (bool)_uiQuickHideField.GetValue(inst);
+                    if (!isShowing) return;
+                }
+                catch { /* field read failed — fall through and call HideUI normally */ }
+            }
             try { _uiHideMethod.Invoke(inst, null); return; }
             catch (Exception e) { Debug.LogWarning("[FastVesselChanger] UIMasterController.HideUI() failed: " + e.Message); }
         }
@@ -499,6 +510,8 @@ public partial class FastVesselChanger : MonoBehaviour
 
             // Step 6: HullcamVDS detection + restore
             Debug.Log("[FastVesselChanger] onFlightReady step 6: hullcam");
+            InitAutoLights();
+            SyncAutoLightsOnVesselReady();
             DetectHullcamVDS();
             var hullcamActiveVessel = FlightGlobals.ActiveVessel;
             _instanceVesselId = hullcamActiveVessel?.id ?? Guid.Empty;
@@ -519,11 +532,11 @@ public partial class FastVesselChanger : MonoBehaviour
             // Initialize per-vessel switch interval text for the current vessel
             if (hullcamActiveVessel != null)
             {
-                int pvInterval;
-                if (_vesselSwitchIntervals.TryGetValue(hullcamActiveVessel.id, out pvInterval))
+                VesselSettings pvS;
+                if (_vesselSettings.TryGetValue(hullcamActiveVessel.id, out pvS) && pvS.switchInterval != 0)
                 {
-                    switchInterval = pvInterval;
-                    switchIntervalText = pvInterval.ToString();
+                    switchInterval = pvS.switchInterval;
+                    switchIntervalText = pvS.switchInterval.ToString();
                 }
             }
 
@@ -532,8 +545,11 @@ public partial class FastVesselChanger : MonoBehaviour
             // (not just FVC switches) so deferred KSP/LMP resets are overridden.
             if (hullcamActiveVessel != null)
             {
-                uint controlFlightId;
-                if (_vesselControlFromHere.TryGetValue(hullcamActiveVessel.id, out controlFlightId) && controlFlightId != 0)
+                uint controlFlightId = 0;
+                VesselSettings cfhVS;
+                if (_vesselSettings.TryGetValue(hullcamActiveVessel.id, out cfhVS))
+                    controlFlightId = cfhVS.controlRefFlightId;
+                if (controlFlightId != 0)
                 {
                     Part controlPart = hullcamActiveVessel.parts?.FirstOrDefault(p => p.flightID == controlFlightId);
                     if (controlPart != null)
@@ -555,24 +571,45 @@ public partial class FastVesselChanger : MonoBehaviour
                 // Arm camera aim + zoom for initial load (SwitchToVessel sets
                 // these for FVC-triggered switches, but a fresh server join /
                 // scene load doesn't go through SwitchToVessel).
-                if (!_pendingZoomRestore)
+                VesselSettings initVS;
+                _vesselSettings.TryGetValue(hullcamActiveVessel.id, out initVS);
+                if (!_pendingZoomRestore && initVS != null && !float.IsNaN(initVS.cameraZoom))
                 {
-                    float savedZoom;
-                    if (_vesselZooms.TryGetValue(hullcamActiveVessel.id, out savedZoom))
-                    {
-                        _pendingZoomVesselId = hullcamActiveVessel.id;
-                        _pendingZoom = savedZoom;
-                        _pendingZoomRestore = true;
-                        _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
-                    }
+                    _pendingZoomVesselId = hullcamActiveVessel.id;
+                    _pendingZoom = initVS.cameraZoom;
+                    _pendingZoomRestore = true;
+                    _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
                 }
-                if (_pendingCameraTarget == 0)
+                if (_pendingCameraTarget == 0 && initVS != null && initVS.cameraTargetFlightId != 0)
                 {
-                    uint savedCamTarget;
-                    if (_vesselCameraTargets.TryGetValue(hullcamActiveVessel.id, out savedCamTarget) && savedCamTarget != 0)
+                    _pendingCameraTarget = initVS.cameraTargetFlightId;
+                    _pendingCameraTargetVesselId = hullcamActiveVessel.id;
+                }
+                // Restore SAS + RCS state
+                if (initVS != null)
+                {
+                    if (initVS.rcsOn)
+                        hullcamActiveVessel.ActionGroups.SetGroup(KSPActionGroup.RCS, true);
+                    if (initVS.sasOn && hullcamActiveVessel.Autopilot != null)
                     {
-                        _pendingCameraTarget = savedCamTarget;
-                        _pendingCameraTargetVesselId = hullcamActiveVessel.id;
+                        // Enable SAS FIRST — SetMode() silently returns false if Enabled is false
+                        hullcamActiveVessel.ActionGroups.SetGroup(KSPActionGroup.SAS, true);
+                        var savedSasMode = (VesselAutopilot.AutopilotMode)initVS.sasMode;
+                        try
+                        {
+                            if (hullcamActiveVessel.Autopilot.CanSetMode(savedSasMode))
+                                hullcamActiveVessel.Autopilot.SetMode(savedSasMode);
+                            // else: mode unavailable (e.g. no probe core or part missing) — leave at StabilityAssist
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogWarning("[FVC] SAS mode restore failed for mode " + savedSasMode + ": " + ex.Message);
+                        }
+                    }
+                    if (initVS.speedMode >= 0)
+                    {
+                        try { FlightGlobals.SetSpeedMode((FlightGlobals.SpeedDisplayModes)initVS.speedMode); }
+                        catch { }
                     }
                 }
             }
@@ -739,9 +776,9 @@ public partial class FastVesselChanger : MonoBehaviour
             var av = FlightGlobals.ActiveVessel;
             if (av != null)
             {
-                int perVessel;
-                if (_vesselSwitchIntervals.TryGetValue(av.id, out perVessel))
-                    effectiveInterval = perVessel;
+                VesselSettings perVS;
+                if (_vesselSettings.TryGetValue(av.id, out perVS) && perVS.switchInterval != 0)
+                    effectiveInterval = perVS.switchInterval;
             }
             double minimumAllowedInterval = Math.Max(effectiveInterval, MINIMUM_SWITCH_INTERVAL);
             if (ut - lastSwitchTime >= minimumAllowedInterval)
@@ -810,6 +847,7 @@ public partial class FastVesselChanger : MonoBehaviour
         }
 
         UpdateHullcam();
+        UpdateAutoLights();
     }
 
     void LateUpdate()
@@ -843,7 +881,7 @@ public partial class FastVesselChanger : MonoBehaviour
                         Debug.Log(string.Format("[FastVesselChanger] Zoom restore clamped: {0:F0} → {1:F0} (startDist={2:F0})",
                             _pendingZoom, cam.startDistance, cam.startDistance));
                         _pendingZoom = cam.startDistance;
-                        _vesselZooms[activeVessel.id] = _pendingZoom; // overwrite the bad saved value
+                        GetOrCreateVesselSettings(activeVessel.id).cameraZoom = _pendingZoom; // overwrite the bad saved value
                     }
 
                     // Camera aim target first (SetTargetPart resets distance)
@@ -936,7 +974,7 @@ public partial class FastVesselChanger : MonoBehaviour
                         && cam.startDistance > 0f && _pendingZoom > cam.startDistance * 10f)
                     {
                         _pendingZoom = cam.startDistance;
-                        _vesselZooms[activeVessel.id] = _pendingZoom;
+                        GetOrCreateVesselSettings(activeVessel.id).cameraZoom = _pendingZoom;
                     }
 
                     // Camera aim target (before zoom, since SetTargetPart resets distance)
@@ -1097,7 +1135,7 @@ public partial class FastVesselChanger : MonoBehaviour
         }
         
         var prevRect = windowRect;
-        windowRect = GUILayout.Window(GetInstanceID(), windowRect, DrawWindow, "Fast Vessel Changer",
+        windowRect = GUILayout.Window(GetInstanceID(), windowRect, DrawWindow, "Fast Vessel Changer  ( / = toggle )",
             GUILayout.Width(FIXED_WINDOW_WIDTH));
         if (windowRect.x != prevRect.x || windowRect.y != prevRect.y)
             SaveUserPrefs();
@@ -1105,7 +1143,7 @@ public partial class FastVesselChanger : MonoBehaviour
 
     void DrawWindow(int id)
     {
-        // Lazy-init styled label for current vessel display
+        // Lazy-init GUIStyles
         if (_currentVesselStyle == null)
         {
             _currentVesselStyle = new GUIStyle(GUI.skin.label)
@@ -1113,6 +1151,16 @@ public partial class FastVesselChanger : MonoBehaviour
                 fontStyle = FontStyle.Bold,
                 alignment = TextAnchor.MiddleCenter
             };
+        }
+        if (_activeVesselRowStyle == null)
+        {
+            _activeVesselRowStyle = new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold };
+            _activeVesselRowStyle.normal.textColor = new Color(1f, 0.88f, 0.35f);
+        }
+        if (_vesselTypeStyle == null)
+        {
+            _vesselTypeStyle = new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleRight };
+            _vesselTypeStyle.normal.textColor = new Color(0.6f, 0.6f, 0.6f);
         }
 
         GUILayout.BeginVertical();
@@ -1124,7 +1172,15 @@ public partial class FastVesselChanger : MonoBehaviour
         GUILayout.BeginHorizontal();
         GUILayout.Label("Vessels (" + selectedCount + " selected):");
         GUILayout.FlexibleSpace();
-        if (GUILayout.Button("Presets", GUILayout.Width(60)))
+        if (GUILayout.Button(userPreferredUIVisible ? "UI: ON" : "UI: OFF", GUILayout.Width(52)))
+        {
+            if (Time.realtimeSinceStartup > _sceneLoadGraceRealtime)
+            {
+                _uiHideDeadlineRealtime = 0f;
+                ToggleFlightUI();
+            }
+        }
+        if (GUILayout.Button("Presets", GUILayout.Width(56)))
         {
             _showPresets = !_showPresets;
             if (_showPresets)
@@ -1133,7 +1189,7 @@ public partial class FastVesselChanger : MonoBehaviour
                 RunAllPresetIntegrityChecks();
             }
         }
-        if (GUILayout.Button("Refresh", GUILayout.Width(60)))
+        if (GUILayout.Button("Refresh", GUILayout.Width(56)))
             RefreshSelectionsFromVessels();
         GUILayout.EndHorizontal();
 
@@ -1146,7 +1202,7 @@ public partial class FastVesselChanger : MonoBehaviour
         vesselSearchText = GUILayout.TextField(vesselSearchText, GUILayout.ExpandWidth(true));
         if (!string.IsNullOrEmpty(vesselSearchText) && GUILayout.Button("X", GUILayout.Width(24)))
             vesselSearchText = "";
-        if (GUILayout.Button((showTypeFilter ? "[-]" : "[+]") + "Filter", GUILayout.Width(62)))
+        if (GUILayout.Button("Filter " + (showTypeFilter ? "\u25b2" : "\u25bc"), GUILayout.Width(62)))
         {
             showTypeFilter = !showTypeFilter;
             SaveUserPrefs();
@@ -1192,6 +1248,7 @@ public partial class FastVesselChanger : MonoBehaviour
             _cachedSortedVessels.Sort((a, b) => string.Compare(a.vesselName, b.vesselName, StringComparison.OrdinalIgnoreCase));
         }
 
+        var activeVessel = FlightGlobals.ActiveVessel;
         bool anyVisible = false;
         foreach (Vessel v in _cachedSortedVessels)
         {
@@ -1206,26 +1263,26 @@ public partial class FastVesselChanger : MonoBehaviour
                 selected[v.id] = prev;
             }
 
+            bool isActive = activeVessel != null && v.id == activeVessel.id;
             GUILayout.BeginHorizontal();
-            if (showCameraControls)
+            bool toggled = GUILayout.Toggle(prev, "", GUILayout.Width(16));
+            if (toggled != prev)
             {
-                bool toggled = GUILayout.Toggle(prev, "");
-                if (toggled != prev)
-                {
-                    selected[v.id] = toggled;
-                    SaveToScenario();
-                    BuildCycleList();
-                }
+                selected[v.id] = toggled;
+                SaveToScenario();
+                BuildCycleList();
             }
-            GUILayout.Label(v.vesselName + "  [" + v.vesselType + "]");
+            GUILayout.Label(v.vesselName, isActive ? (_activeVesselRowStyle ?? GUI.skin.label) : GUI.skin.label);
             GUILayout.FlexibleSpace();
-            if (GUILayout.Button("GO", GUILayout.Width(30)) && FlightGlobals.ready)
+            GUILayout.Label("[" + v.vesselType + "]", _vesselTypeStyle ?? GUI.skin.label, GUILayout.Width(68));
+            DrawAutoLightsButton(v);
+            if (GUILayout.Button("GO", GUILayout.Width(44)) && FlightGlobals.ready)
             {
                 var currentVessel = FlightGlobals.ActiveVessel;
                 if (currentVessel != null)
                 {
                     var cam = FlightCamera.fetch;
-                    if (cam != null && _hullcamLastActivatedModule == null) _vesselZooms[currentVessel.id] = cam.Distance;
+                    if (cam != null && _hullcamLastActivatedModule == null) GetOrCreateVesselSettings(currentVessel.id).cameraZoom = cam.Distance;
                 }
                 shuffleRemaining.RemoveAll(sv => sv != null && sv.id == v.id);
                 SwitchToVessel(v);
@@ -1239,40 +1296,46 @@ public partial class FastVesselChanger : MonoBehaviour
 
         GUILayout.EndScrollView();
 
-        // Divider between vessel list and current vessel.
-        GUILayout.Space(4);
-        GUILayout.Box("", GUILayout.Height(1), GUILayout.ExpandWidth(true));
-        GUILayout.Space(4);
-
-        // ---- Current Vessel ----
-        {
-            var cv = FlightGlobals.ActiveVessel;
-            string cvName = cv != null ? cv.vesselName : "—";
-            GUILayout.BeginHorizontal();
-            GUILayout.FlexibleSpace();
-            GUILayout.Label("Now Viewing:  " + cvName, _currentVesselStyle ?? GUI.skin.label);
-            GUILayout.FlexibleSpace();
-            GUILayout.EndHorizontal();
-        }
-
-        // Divider between current vessel and controls.
+        // Divider between vessel list and controls.
         GUILayout.Space(4);
         GUILayout.Box("", GUILayout.Height(1), GUILayout.ExpandWidth(true));
         GUILayout.Space(6);
 
         // ---- Camera Controls ----
-        if (GUILayout.Button((showCameraControls ? "[-] " : "[+] ") + "Camera Controls"))
         {
-            showCameraControls = !showCameraControls;
-            SaveUserPrefs();
+            string camCtrlLabel;
+            if (showCameraControls)
+            {
+                camCtrlLabel = "[-] Camera Controls";
+            }
+            else
+            {
+                string autoStr = autoEnabled ? "AUTO: ON" : "AUTO: OFF";
+                string countStr = "";
+                if (autoEnabled)
+                {
+                    int dispInt = switchInterval;
+                    var curVL = FlightGlobals.ActiveVessel;
+                    if (curVL != null) { VesselSettings pvL; if (_vesselSettings.TryGetValue(curVL.id, out pvL) && pvL.switchInterval != 0) dispInt = pvL.switchInterval; }
+                    double effL = Math.Max(dispInt, MINIMUM_SWITCH_INTERVAL);
+                    double remL = Math.Max(0, effL - (Planetarium.GetUniversalTime() - lastSwitchTime));
+                    countStr = "  \u00b7 " + remL.ToString("F0") + "s";
+                }
+                camCtrlLabel = "[+] Camera Controls    " + autoStr + countStr;
+            }
+            if (GUILayout.Button(camCtrlLabel))
+            {
+                showCameraControls = !showCameraControls;
+                SaveUserPrefs();
+            }
         }
         if (showCameraControls)
         {
             GUILayout.BeginVertical("box");
 
-            // ---- Vessel Selection ----
+            // ---- Top row: Select/Deselect left, Next Now right ----
             GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Select Visible", GUILayout.ExpandWidth(true)))
+            if (GUILayout.Button("Select Visible", GUILayout.Width(90)))
             {
                 foreach (Vessel sv in _cachedSortedVessels)
                 {
@@ -1283,27 +1346,15 @@ public partial class FastVesselChanger : MonoBehaviour
                 SaveToScenario();
                 BuildCycleList();
             }
-            if (GUILayout.Button("Deselect All", GUILayout.ExpandWidth(true)))
+            if (GUILayout.Button("Deselect All", GUILayout.Width(82)))
             {
                 foreach (var key in selected.Keys.ToList())
                     selected[key] = false;
                 SaveToScenario();
                 BuildCycleList();
             }
-            GUILayout.EndHorizontal();
-
-            GUILayout.Space(4);
-
-            // ---- Auto Switch Controls ----
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Auto Switch:", GUILayout.Width(80));
-            if (GUILayout.Button(autoEnabled ? "ON" : "OFF", GUILayout.Width(40)))
-            {
-                ToggleAuto();
-            }
-            GUILayout.Label("Interval:", GUILayout.Width(52));
-            switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(45));
-            if (GUILayout.Button("Next Now", GUILayout.ExpandWidth(true)))
+            GUILayout.FlexibleSpace();
+            if (GUILayout.Button("Next Now", GUILayout.Width(75)))
             {
                 double ut = Planetarium.GetUniversalTime();
                 double timeSinceLastSwitch = ut - lastSwitchTime;
@@ -1318,6 +1369,19 @@ public partial class FastVesselChanger : MonoBehaviour
                     ScreenMessages.PostScreenMessage("Wait " + timeRemaining + " more seconds before switching", 3f, ScreenMessageStyle.UPPER_CENTER);
                 }
             }
+            GUILayout.EndHorizontal();
+
+            GUILayout.Space(4);
+
+            // ---- Auto Switch Controls ----
+            GUILayout.BeginHorizontal();
+            GUILayout.Label("Auto Switch:", GUILayout.Width(80));
+            if (GUILayout.Button(autoEnabled ? "ON" : "OFF", GUILayout.Width(40)))
+            {
+                ToggleAuto();
+            }
+            GUILayout.Label("Interval:", GUILayout.Width(52));
+            switchIntervalText = GUILayout.TextField(switchIntervalText, GUILayout.Width(45));
             int parsed;
             if (int.TryParse(switchIntervalText, out parsed) && parsed > 0)
             {
@@ -1329,7 +1393,7 @@ public partial class FastVesselChanger : MonoBehaviour
                     // Store per-vessel override
                     var ivVessel = FlightGlobals.ActiveVessel;
                     if (ivVessel != null)
-                        _vesselSwitchIntervals[ivVessel.id] = parsed;
+                        GetOrCreateVesselSettings(ivVessel.id).switchInterval = parsed;
                     pendingInterval = -1;
                 }
                 else
@@ -1348,9 +1412,9 @@ public partial class FastVesselChanger : MonoBehaviour
                 var curV = FlightGlobals.ActiveVessel;
                 if (curV != null)
                 {
-                    int pvI;
-                    if (_vesselSwitchIntervals.TryGetValue(curV.id, out pvI))
-                        displayInterval = pvI;
+                    VesselSettings pvI;
+                    if (_vesselSettings.TryGetValue(curV.id, out pvI) && pvI.switchInterval != 0)
+                        displayInterval = pvI.switchInterval;
                 }
                 double effectiveInterval2 = Math.Max(displayInterval, MINIMUM_SWITCH_INTERVAL);
                 double remaining2 = Math.Max(0, effectiveInterval2 - (Planetarium.GetUniversalTime() - lastSwitchTime));
@@ -1361,34 +1425,18 @@ public partial class FastVesselChanger : MonoBehaviour
                 GUILayout.Label(" ");
             }
 
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Flight UI: " + (userPreferredUIVisible ? "VISIBLE" : "HIDDEN"), GUILayout.Width(120));
-            if (GUILayout.Button("Toggle Flight UI", GUILayout.Width(120)))
-            {
-                // Ignore clicks during the post-scene-load grace period to prevent
-                // phantom IMGUI button hits from layout-shift during initialisation.
-                if (Time.realtimeSinceStartup > _sceneLoadGraceRealtime)
-                {
-                    // Cancel any aggressive re-hide — user explicitly wants to toggle.
-                    _uiHideDeadlineRealtime = 0f;
-                    ToggleFlightUI();
-                }
-            }
-            GUILayout.EndHorizontal();
+            GUILayout.Space(4);
 
-            GUILayout.Space(6);
-
+            // ---- Auto Rotation + Random rates ----
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Auto Rotation:", GUILayout.Width(100));
+            GUILayout.Label("Auto Rot:", GUILayout.Width(62));
             if (GUILayout.Button(cameraRotEnabled ? "ON" : "OFF", GUILayout.Width(40)))
             {
                 cameraRotEnabled = !cameraRotEnabled;
                 SaveToScenario();
             }
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Random rates on switch:", GUILayout.Width(150));
+            GUILayout.Space(10);
+            GUILayout.Label("Random:", GUILayout.Width(56));
             if (GUILayout.Button(cameraRotRandomEnabled ? "ON" : "OFF", GUILayout.Width(40)))
             {
                 cameraRotRandomEnabled = !cameraRotRandomEnabled;
@@ -1396,16 +1444,16 @@ public partial class FastVesselChanger : MonoBehaviour
             }
             GUILayout.EndHorizontal();
 
-            // Pitch (X) row
+            // ---- Pitch + Orbit on one row ----
             GUILayout.BeginHorizontal();
-            GUILayout.Label("Pitch (X) deg/s:", GUILayout.Width(105));
+            GUILayout.Label("Pitch:", GUILayout.Width(38));
             if (GUILayout.Button("-", GUILayout.Width(22)))
             {
                 cameraRotXRate = (float)Math.Round(cameraRotXRate - 1f, 1);
                 cameraRotXText = cameraRotXRate.ToString("F1");
                 SaveToScenario();
             }
-            string newXText = GUILayout.TextField(cameraRotXText, GUILayout.Width(50));
+            string newXText = GUILayout.TextField(cameraRotXText, GUILayout.Width(42));
             if (newXText != cameraRotXText)
             {
                 cameraRotXText = newXText;
@@ -1422,18 +1470,15 @@ public partial class FastVesselChanger : MonoBehaviour
                 cameraRotXText = cameraRotXRate.ToString("F1");
                 SaveToScenario();
             }
-            GUILayout.EndHorizontal();
-
-            // Orbit (Y) row
-            GUILayout.BeginHorizontal();
-            GUILayout.Label("Orbit (Y) deg/s:", GUILayout.Width(105));
+            GUILayout.Space(6);
+            GUILayout.Label("Orbit:", GUILayout.Width(38));
             if (GUILayout.Button("-", GUILayout.Width(22)))
             {
                 cameraRotYRate = (float)Math.Round(cameraRotYRate - 1f, 1);
                 cameraRotYText = cameraRotYRate.ToString("F1");
                 SaveToScenario();
             }
-            string newYText = GUILayout.TextField(cameraRotYText, GUILayout.Width(50));
+            string newYText = GUILayout.TextField(cameraRotYText, GUILayout.Width(42));
             if (newYText != cameraRotYText)
             {
                 cameraRotYText = newYText;
@@ -1456,9 +1501,6 @@ public partial class FastVesselChanger : MonoBehaviour
         }
 
         DrawHullcamSection();
-
-        GUILayout.Space(4);
-        GUILayout.Label("Tip: Press '/' to toggle this window.");
 
         GUILayout.EndVertical();
 
@@ -1724,7 +1766,7 @@ public partial class FastVesselChanger : MonoBehaviour
                         zoomToSave, cam.startDistance, cam.startDistance));
                     zoomToSave = cam.startDistance;
                 }
-                _vesselZooms[currentVessel.id] = zoomToSave;
+                GetOrCreateVesselSettings(currentVessel.id).cameraZoom = zoomToSave;
                 VerboseLog("[FastVesselChanger] Captured zoom before switch: vessel=" + currentVessel.vesselName + " id=" + currentVessel.id + " zoom=" + zoomToSave);
             }
             else
@@ -1737,7 +1779,7 @@ public partial class FastVesselChanger : MonoBehaviour
             {
                 var aimPart = cam.Target.GetComponentInParent<Part>();
                 if (aimPart != null && aimPart.flightID != 0)
-                    _vesselCameraTargets[currentVessel.id] = aimPart.flightID;
+                    GetOrCreateVesselSettings(currentVessel.id).cameraTargetFlightId = aimPart.flightID;
             }
 
             // Save "Control From Here" — use referenceTransformId directly
@@ -1745,12 +1787,22 @@ public partial class FastVesselChanger : MonoBehaviour
             uint switchRefId = currentVessel.referenceTransformId;
             if (switchRefId != 0)
             {
-                _vesselControlFromHere[currentVessel.id] = switchRefId;
+                GetOrCreateVesselSettings(currentVessel.id).controlRefFlightId = switchRefId;
                 var refPart = currentVessel.parts?.FirstOrDefault(p => p.flightID == switchRefId);
                 Debug.Log("[FastVesselChanger] CFH capture on switch-away: vessel=" + currentVessel.vesselName
                     + " refTransformId=" + switchRefId
                     + " partName=" + (refPart != null ? refPart.partInfo.title : "NOT_FOUND"));
             }
+            // Save SAS + RCS state before switch
+            if (currentVessel.Autopilot != null)
+            {
+                var switchVS = GetOrCreateVesselSettings(currentVessel.id);
+                switchVS.sasOn   = currentVessel.Autopilot.Enabled;
+                switchVS.sasMode = (int)currentVessel.Autopilot.Mode;
+            }
+            GetOrCreateVesselSettings(currentVessel.id).rcsOn =
+                currentVessel.ActionGroups[KSPActionGroup.RCS];
+            GetOrCreateVesselSettings(currentVessel.id).speedMode = (int)FlightGlobals.speedDisplayMode;
         }
 
         // Save hull cam state for the vessel we're leaving.
@@ -1817,10 +1869,10 @@ public partial class FastVesselChanger : MonoBehaviour
         // If the destination vessel has hull cam enabled, arm the blackout overlay
         // so OnGUI draws a full-screen black rect from scene-start until the hull cam
         // activates inside OnFlightReady, hiding the stock FlightCamera flash.
-        VesselHullcamSettings hcSet;
         if (_hullcamInstalled
-            && _vesselHullcamSettings.TryGetValue(v.id, out hcSet)
-            && hcSet.hullcamEnabled)
+            && _vesselSettings.TryGetValue(v.id, out var hcVS)
+            && hcVS.hullcam != null
+            && hcVS.hullcam.hullcamEnabled)
         {
             _pendingHullcamBlackout = true;
             _hullcamBlackoutDeadline = Time.realtimeSinceStartup + 5f;
@@ -1855,21 +1907,21 @@ public partial class FastVesselChanger : MonoBehaviour
 
         // Queue zoom restore — end-of-frame coroutine will keep re-applying for
         // ZOOM_RESTORE_FRAMES frames to override deferred FlightCamera.SetTarget() calls.
-        float savedZoom;
-        if (_vesselZooms.TryGetValue(v.id, out savedZoom))
+        VesselSettings restoreVS;
+        _vesselSettings.TryGetValue(v.id, out restoreVS);
+        if (restoreVS != null && !float.IsNaN(restoreVS.cameraZoom))
         {
             _pendingZoomVesselId = v.id;
-            _pendingZoom = savedZoom;
+            _pendingZoom = restoreVS.cameraZoom;
             _pendingZoomRestore = true;
             _pendingZoomFramesRemaining = ZOOM_RESTORE_FRAMES;
-            VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + savedZoom);
+            VerboseLog("[FastVesselChanger] RestoreZoom queued: vessel=" + v.vesselName + " id=" + v.id + " zoom=" + restoreVS.cameraZoom);
         }
 
         // Queue camera aim target restore
-        uint savedCamTarget;
-        if (_vesselCameraTargets.TryGetValue(v.id, out savedCamTarget) && savedCamTarget != 0)
+        if (restoreVS != null && restoreVS.cameraTargetFlightId != 0)
         {
-            _pendingCameraTarget = savedCamTarget;
+            _pendingCameraTarget = restoreVS.cameraTargetFlightId;
             _pendingCameraTargetVesselId = v.id;
         }
         else
@@ -1879,10 +1931,9 @@ public partial class FastVesselChanger : MonoBehaviour
         }
 
         // Queue control-from-here restore
-        uint savedControl;
-        if (_vesselControlFromHere.TryGetValue(v.id, out savedControl) && savedControl != 0)
+        if (restoreVS != null && restoreVS.controlRefFlightId != 0)
         {
-            _pendingControlFromHere = savedControl;
+            _pendingControlFromHere = restoreVS.controlRefFlightId;
             _pendingControlFromHereVesselId = v.id;
             _pendingControlFromHereFrames = CONTROL_RESTORE_FRAMES;
         }
@@ -2017,64 +2068,96 @@ public partial class FastVesselChanger : MonoBehaviour
                 }
             }
 
-            // Per-vessel zoom levels
-            XmlElement zoomsNode = playerSection["VesselZooms"];
-            if (zoomsNode != null)
+            // Per-vessel settings — consolidated format.
+            // Falls back to legacy separate sections for migration from older XML files.
+            _vesselSettings.Clear();
+            XmlElement vesselSettingsNode = playerSection["VesselSettings"];
+            if (vesselSettingsNode != null)
             {
-                _vesselZooms.Clear();
-                foreach (XmlElement z in zoomsNode.GetElementsByTagName("Zoom"))
+                foreach (XmlElement vesEl in vesselSettingsNode.GetElementsByTagName("Vessel"))
                 {
-                    Guid vesselId;
-                    float zoom;
-                    if (!Guid.TryParse(z.GetAttribute("vessel"), out vesselId)) continue;
-                    if (!float.TryParse(z.GetAttribute("distance"), NumberStyles.Float, CultureInfo.InvariantCulture, out zoom)) continue;
-                    _vesselZooms[vesselId] = zoom;
+                    Guid vsId;
+                    if (!Guid.TryParse(vesEl.GetAttribute("id"), out vsId)) continue;
+                    var vs = GetOrCreateVesselSettings(vsId);
+                    float parsedZoom;
+                    string zoomStr = vesEl.GetAttribute("zoom");
+                    if (!string.IsNullOrEmpty(zoomStr) &&
+                        float.TryParse(zoomStr, NumberStyles.Float, CultureInfo.InvariantCulture, out parsedZoom))
+                        vs.cameraZoom = parsedZoom;
+                    uint parsedU;
+                    if (uint.TryParse(vesEl.GetAttribute("camTarget"),    out parsedU)) vs.cameraTargetFlightId = parsedU;
+                    if (uint.TryParse(vesEl.GetAttribute("controlRef"),   out parsedU)) vs.controlRefFlightId   = parsedU;
+                    int parsedI;
+                    if (int.TryParse(vesEl.GetAttribute("switchInterval"), out parsedI)) vs.switchInterval = parsedI;
+                    vs.autoLightsEnabled = ParseBool(vesEl.GetAttribute("autoLights"), true);
+                    vs.sasOn             = ParseBool(vesEl.GetAttribute("sasOn"),      false);
+                    vs.rcsOn             = ParseBool(vesEl.GetAttribute("rcsOn"),      false);
+                    if (int.TryParse(vesEl.GetAttribute("sasMode"), out parsedI))       vs.sasMode = parsedI;
+                    if (int.TryParse(vesEl.GetAttribute("speedMode"), out parsedI) && parsedI >= 0) vs.speedMode = parsedI;
+                    XmlElement hcEl = vesEl["Hullcam"];
+                    if (hcEl != null)
+                    {
+                        var hc = GetOrCreateHullcam(vsId);
+                        hc.hullcamEnabled  = ParseBool(hcEl.GetAttribute("enabled"),        false);
+                        hc.hullcamInterval = Mathf.Max(1f, ParseFloat(hcEl.GetAttribute("interval"), 10f));
+                        hc.includeExternal = ParseBool(hcEl.GetAttribute("includeExternal"), true);
+                        foreach (XmlElement sc in hcEl.GetElementsByTagName("SelectedCam"))
+                        { uint fid; if (uint.TryParse(sc.GetAttribute("flightId"), out fid)) hc.selectedFlightIds.Add(fid); }
+                        foreach (XmlElement dc in hcEl.GetElementsByTagName("DisabledCam"))
+                        { uint fid; if (uint.TryParse(dc.GetAttribute("flightId"), out fid)) hc.disabledFlightIds.Add(fid); }
+                    }
                 }
+                Debug.Log("[FastVesselChanger] LoadUserPrefs: loaded " + _vesselSettings.Count + " vessel entries");
             }
-
-            // Per-vessel camera aim targets
-            XmlElement camTargetsNode = playerSection["VesselCameraTargets"];
-            if (camTargetsNode != null)
+            else
             {
-                _vesselCameraTargets.Clear();
-                foreach (XmlElement t in camTargetsNode.GetElementsByTagName("Target"))
-                {
-                    Guid vesselId;
-                    uint flightId;
-                    if (!Guid.TryParse(t.GetAttribute("vessel"), out vesselId)) continue;
-                    if (!uint.TryParse(t.GetAttribute("flightId"), out flightId)) continue;
-                    _vesselCameraTargets[vesselId] = flightId;
-                }
-            }
-
-            // Per-vessel control-from-here references
-            XmlElement controlNode = playerSection["VesselControlFromHere"];
-            if (controlNode != null)
-            {
-                _vesselControlFromHere.Clear();
-                foreach (XmlElement c in controlNode.GetElementsByTagName("Control"))
-                {
-                    Guid vesselId;
-                    uint flightId;
-                    if (!Guid.TryParse(c.GetAttribute("vessel"), out vesselId)) continue;
-                    if (!uint.TryParse(c.GetAttribute("flightId"), out flightId)) continue;
-                    _vesselControlFromHere[vesselId] = flightId;
-                }
-            }
-
-            // Per-vessel switch intervals
-            XmlElement intervalsNode = playerSection["VesselSwitchIntervals"];
-            if (intervalsNode != null)
-            {
-                _vesselSwitchIntervals.Clear();
-                foreach (XmlElement intEl in intervalsNode.GetElementsByTagName("Interval"))
-                {
-                    Guid vesselId;
-                    int seconds;
-                    if (!Guid.TryParse(intEl.GetAttribute("vessel"), out vesselId)) continue;
-                    if (!int.TryParse(intEl.GetAttribute("seconds"), out seconds)) continue;
-                    _vesselSwitchIntervals[vesselId] = seconds;
-                }
+                // Migration: read legacy separate sections into _vesselSettings
+                XmlElement zoomsNode = playerSection["VesselZooms"];
+                if (zoomsNode != null)
+                    foreach (XmlElement z in zoomsNode.GetElementsByTagName("Zoom"))
+                    { Guid g; float f;
+                      if (Guid.TryParse(z.GetAttribute("vessel"), out g) &&
+                          float.TryParse(z.GetAttribute("distance"), NumberStyles.Float, CultureInfo.InvariantCulture, out f))
+                          GetOrCreateVesselSettings(g).cameraZoom = f; }
+                XmlElement camTargetsNode = playerSection["VesselCameraTargets"];
+                if (camTargetsNode != null)
+                    foreach (XmlElement t in camTargetsNode.GetElementsByTagName("Target"))
+                    { Guid g; uint u;
+                      if (Guid.TryParse(t.GetAttribute("vessel"), out g) && uint.TryParse(t.GetAttribute("flightId"), out u))
+                          GetOrCreateVesselSettings(g).cameraTargetFlightId = u; }
+                XmlElement controlNode = playerSection["VesselControlFromHere"];
+                if (controlNode != null)
+                    foreach (XmlElement c in controlNode.GetElementsByTagName("Control"))
+                    { Guid g; uint u;
+                      if (Guid.TryParse(c.GetAttribute("vessel"), out g) && uint.TryParse(c.GetAttribute("flightId"), out u))
+                          GetOrCreateVesselSettings(g).controlRefFlightId = u; }
+                XmlElement intervalsNode = playerSection["VesselSwitchIntervals"];
+                if (intervalsNode != null)
+                    foreach (XmlElement intEl in intervalsNode.GetElementsByTagName("Interval"))
+                    { Guid g; int i;
+                      if (Guid.TryParse(intEl.GetAttribute("vessel"), out g) && int.TryParse(intEl.GetAttribute("seconds"), out i))
+                          GetOrCreateVesselSettings(g).switchInterval = i; }
+                XmlElement hullcamsNode = playerSection["HullcamSettings"];
+                if (hullcamsNode != null)
+                    foreach (XmlElement hc in hullcamsNode.GetElementsByTagName("VesselHullcam"))
+                    { Guid g;
+                      if (!Guid.TryParse(hc.GetAttribute("vessel"), out g)) continue;
+                      var s = GetOrCreateHullcam(g);
+                      s.hullcamEnabled  = ParseBool(hc.GetAttribute("enabled"), false);
+                      s.hullcamInterval = Mathf.Max(1f, ParseFloat(hc.GetAttribute("interval"), 10f));
+                      s.includeExternal = ParseBool(hc.GetAttribute("includeExternal"), true);
+                      foreach (XmlElement sc in hc.GetElementsByTagName("SelectedCam"))
+                      { uint fid; if (uint.TryParse(sc.GetAttribute("flightId"), out fid)) s.selectedFlightIds.Add(fid); }
+                      foreach (XmlElement dc in hc.GetElementsByTagName("DisabledCam"))
+                      { uint fid; if (uint.TryParse(dc.GetAttribute("flightId"), out fid)) s.disabledFlightIds.Add(fid); } }
+                XmlElement autoLightsNode = playerSection["VesselAutoLights"];
+                if (autoLightsNode != null)
+                    foreach (XmlElement al in autoLightsNode.GetElementsByTagName("Vessel"))
+                    { Guid g; bool val;
+                      if (Guid.TryParse(al.GetAttribute("id"), out g) && bool.TryParse(al.GetAttribute("enabled"), out val))
+                          GetOrCreateVesselSettings(g).autoLightsEnabled = val; }
+                if (_vesselSettings.Count > 0)
+                    Debug.Log("[FastVesselChanger] LoadUserPrefs: migrated " + _vesselSettings.Count + " entries from legacy format");
             }
 
             // Shuffle bag remainder — stored as vessel IDs, resolved against cycleList later
@@ -2086,36 +2169,6 @@ public partial class FastVesselChanger : MonoBehaviour
                 {
                     _loadedShuffleBagIds.Add(v.GetAttribute("id"));
                 }
-            }
-
-            // Per-vessel hullcam settings
-            XmlElement hullcamsNode = playerSection["HullcamSettings"];
-            if (hullcamsNode != null)
-            {
-                _vesselHullcamSettings.Clear();
-                foreach (XmlElement hc in hullcamsNode.GetElementsByTagName("VesselHullcam"))
-                {
-                    Guid vesselId;
-                    if (!Guid.TryParse(hc.GetAttribute("vessel"), out vesselId)) continue;
-                    var s = new VesselHullcamSettings();
-                    s.hullcamEnabled = ParseBool(hc.GetAttribute("enabled"), false);
-                    s.hullcamInterval = Mathf.Max(1f, ParseFloat(hc.GetAttribute("interval"), 10f));
-                    s.includeExternal = ParseBool(hc.GetAttribute("includeExternal"), true);
-                    foreach (XmlElement cam in hc.GetElementsByTagName("SelectedCam"))
-                    {
-                        uint fid;
-                        if (uint.TryParse(cam.GetAttribute("flightId"), out fid))
-                            s.selectedFlightIds.Add(fid);
-                    }
-                    foreach (XmlElement dis in hc.GetElementsByTagName("DisabledCam"))
-                    {
-                        uint fid;
-                        if (uint.TryParse(dis.GetAttribute("flightId"), out fid))
-                            s.disabledFlightIds.Add(fid);
-                    }
-                    _vesselHullcamSettings[vesselId] = s;
-                }
-                Debug.Log("[FastVesselChanger] LoadUserPrefs: loaded " + _vesselHullcamSettings.Count + " hullcam entries");
             }
 
             // Presets
@@ -2231,79 +2284,40 @@ public partial class FastVesselChanger : MonoBehaviour
             }
             playerSection.AppendChild(shuffleNode);
 
-            // Per-vessel switch intervals
-            XmlElement intervalsNode = doc.CreateElement("VesselSwitchIntervals");
-            foreach (var kvInt in _vesselSwitchIntervals)
-            {
-                XmlElement intEl = doc.CreateElement("Interval");
-                intEl.SetAttribute("vessel", kvInt.Key.ToString());
-                intEl.SetAttribute("seconds", kvInt.Value.ToString());
-                intervalsNode.AppendChild(intEl);
-            }
-            playerSection.AppendChild(intervalsNode);
-
-            // Per-vessel zoom levels
-            XmlElement zoomsNode = doc.CreateElement("VesselZooms");
-            foreach (var kvZoom in _vesselZooms)
-            {
-                if (float.IsNaN(kvZoom.Value) || float.IsInfinity(kvZoom.Value)) continue;
-                XmlElement z = doc.CreateElement("Zoom");
-                z.SetAttribute("vessel", kvZoom.Key.ToString());
-                z.SetAttribute("distance", kvZoom.Value.ToString(CultureInfo.InvariantCulture));
-                zoomsNode.AppendChild(z);
-            }
-            playerSection.AppendChild(zoomsNode);
-
-            // Per-vessel camera aim targets
-            XmlElement camTargetsNode = doc.CreateElement("VesselCameraTargets");
-            foreach (var kvCam in _vesselCameraTargets)
-            {
-                if (kvCam.Value == 0) continue;
-                XmlElement t = doc.CreateElement("Target");
-                t.SetAttribute("vessel", kvCam.Key.ToString());
-                t.SetAttribute("flightId", kvCam.Value.ToString());
-                camTargetsNode.AppendChild(t);
-            }
-            playerSection.AppendChild(camTargetsNode);
-
-            // Per-vessel control-from-here references
-            XmlElement controlNode = doc.CreateElement("VesselControlFromHere");
-            foreach (var kvCtrl in _vesselControlFromHere)
-            {
-                if (kvCtrl.Value == 0) continue;
-                XmlElement c = doc.CreateElement("Control");
-                c.SetAttribute("vessel", kvCtrl.Key.ToString());
-                c.SetAttribute("flightId", kvCtrl.Value.ToString());
-                controlNode.AppendChild(c);
-            }
-            playerSection.AppendChild(controlNode);
-
-            // Per-vessel hullcam settings
+            // Per-vessel settings — all per-vessel data in one consolidated block
             SyncCurrentHullcamStateToDict();
-            XmlElement hullcamsNode = doc.CreateElement("HullcamSettings");
-            foreach (var kvHc in _vesselHullcamSettings)
+            XmlElement vesselSettingsNode = doc.CreateElement("VesselSettings");
+            foreach (var kvVS in _vesselSettings)
             {
-                var hs = kvHc.Value;
-                XmlElement hc = doc.CreateElement("VesselHullcam");
-                hc.SetAttribute("vessel", kvHc.Key.ToString());
-                hc.SetAttribute("enabled", hs.hullcamEnabled.ToString());
-                hc.SetAttribute("interval", hs.hullcamInterval.ToString(CultureInfo.InvariantCulture));
-                hc.SetAttribute("includeExternal", hs.includeExternal.ToString());
-                foreach (var fid in hs.selectedFlightIds)
+                var vs = kvVS.Value;
+                if (!vs.HasAnyPersistableData()) continue;
+                XmlElement vesEl = doc.CreateElement("Vessel");
+                vesEl.SetAttribute("id", kvVS.Key.ToString());
+                if (!float.IsNaN(vs.cameraZoom) && !float.IsInfinity(vs.cameraZoom))
+                    vesEl.SetAttribute("zoom", vs.cameraZoom.ToString(CultureInfo.InvariantCulture));
+                if (vs.cameraTargetFlightId != 0) vesEl.SetAttribute("camTarget",      vs.cameraTargetFlightId.ToString());
+                if (vs.controlRefFlightId   != 0) vesEl.SetAttribute("controlRef",     vs.controlRefFlightId.ToString());
+                if (vs.switchInterval       != 0) vesEl.SetAttribute("switchInterval", vs.switchInterval.ToString());
+                if (!vs.autoLightsEnabled)        vesEl.SetAttribute("autoLights",     "False");
+                if (vs.sasOn)                   { vesEl.SetAttribute("sasOn",          "True");
+                                                  vesEl.SetAttribute("sasMode",        vs.sasMode.ToString()); }
+                if (vs.rcsOn)                     vesEl.SetAttribute("rcsOn",          "True");
+                if (vs.speedMode >= 0)             vesEl.SetAttribute("speedMode",      vs.speedMode.ToString());
+                if (vs.hullcam != null)
                 {
-                    XmlElement cam = doc.CreateElement("SelectedCam");
-                    cam.SetAttribute("flightId", fid.ToString());
-                    hc.AppendChild(cam);
+                    XmlElement hcEl = doc.CreateElement("Hullcam");
+                    hcEl.SetAttribute("enabled",         vs.hullcam.hullcamEnabled.ToString());
+                    hcEl.SetAttribute("interval",        vs.hullcam.hullcamInterval.ToString(CultureInfo.InvariantCulture));
+                    hcEl.SetAttribute("includeExternal", vs.hullcam.includeExternal.ToString());
+                    foreach (var fid in vs.hullcam.selectedFlightIds)
+                    { var sc = doc.CreateElement("SelectedCam"); sc.SetAttribute("flightId", fid.ToString()); hcEl.AppendChild(sc); }
+                    foreach (var fid in vs.hullcam.disabledFlightIds)
+                    { var dc = doc.CreateElement("DisabledCam"); dc.SetAttribute("flightId", fid.ToString()); hcEl.AppendChild(dc); }
+                    vesEl.AppendChild(hcEl);
                 }
-                foreach (var fid in hs.disabledFlightIds)
-                {
-                    XmlElement dis = doc.CreateElement("DisabledCam");
-                    dis.SetAttribute("flightId", fid.ToString());
-                    hc.AppendChild(dis);
-                }
-                hullcamsNode.AppendChild(hc);
+                vesselSettingsNode.AppendChild(vesEl);
             }
-            playerSection.AppendChild(hullcamsNode);
+            playerSection.AppendChild(vesselSettingsNode);
 
             // Presets
             SavePresetsToXml(doc, playerSection);
@@ -2375,7 +2389,7 @@ public partial class FastVesselChanger : MonoBehaviour
                             zoomToSave, cam.startDistance, cam.startDistance));
                         zoomToSave = cam.startDistance;
                     }
-                    _vesselZooms[_instanceVesselId] = zoomToSave;
+                    GetOrCreateVesselSettings(_instanceVesselId).cameraZoom = zoomToSave;
                 }
             }
 
@@ -2394,7 +2408,7 @@ public partial class FastVesselChanger : MonoBehaviour
                     {
                         var aimPart = cam.Target.GetComponentInParent<Part>();
                         if (aimPart != null && aimPart.flightID != 0)
-                            _vesselCameraTargets[_instanceVesselId] = aimPart.flightID;
+                            GetOrCreateVesselSettings(_instanceVesselId).cameraTargetFlightId = aimPart.flightID;
                     }
                 }
             }
@@ -2411,7 +2425,7 @@ public partial class FastVesselChanger : MonoBehaviour
                     uint refId = av.referenceTransformId;
                     if (refId != 0)
                     {
-                        _vesselControlFromHere[_instanceVesselId] = refId;
+                        GetOrCreateVesselSettings(_instanceVesselId).controlRefFlightId = refId;
                         Debug.Log("[FastVesselChanger] CFH snapshot in SaveToScenario: vessel=" + av.vesselName
                             + " refTransformId=" + refId);
                     }
@@ -2425,13 +2439,26 @@ public partial class FastVesselChanger : MonoBehaviour
             // Sync active vessel's hull cam state to the dict before serializing
             SyncCurrentHullcamStateToDict();
 
+            // Snapshot SAS + RCS for current vessel
+            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0 && !_isDestroying)
+            {
+                var av = FlightGlobals.ActiveVessel;
+                if (av != null && av.Autopilot != null)
+                {
+                    var snapVS = GetOrCreateVesselSettings(_instanceVesselId);
+                    snapVS.sasOn      = av.Autopilot.Enabled;
+                    snapVS.sasMode    = (int)av.Autopilot.Mode;
+                    snapVS.rcsOn      = av.ActionGroups[KSPActionGroup.RCS];
+                    snapVS.speedMode  = (int)FlightGlobals.speedDisplayMode;
+                }
+            }
+
             // All persistence now goes through the XML file
             SaveUserPrefs();
 
             if (VERBOSE_DIAGNOSTICS)
                 Debug.Log("[FastVesselChanger] SaveToScenario: persisted to XML"
-                    + " (vesselZooms=" + _vesselZooms.Count
-                    + " hullcamEntries=" + _vesselHullcamSettings.Count + ")");
+                    + " (vesselEntries=" + _vesselSettings.Count + ")");
         }
         catch (Exception e)
         {
