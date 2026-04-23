@@ -19,6 +19,7 @@ LUNAMULTIPLAYER.md
 *.htm
 NuGet.config
 *.log
+*.log.txt
 
 # GameData Plugins (built output — not source-controlled)
 GameData/*/Plugins/*.dll

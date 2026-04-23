@@ -109,6 +109,21 @@ public partial class FastVesselChanger : MonoBehaviour
     private static int _pendingControlFromHereFrames = 0;
     private const int CONTROL_RESTORE_FRAMES = 180; // ~3s at 60fps — longer than zoom to outlast LMP syncs
 
+    // Deferred SAS mode restore — VesselAutopilot.CanSetMode() depends on
+    // SASServiceLevel which isn't populated until the Autopilot runs Start().
+    // Re-apply until the mode reads back correctly and stays stable.
+    private static bool _pendingSASRestore = false;
+    private static Guid _pendingSASVesselId = Guid.Empty;
+    private static int _pendingSASMode = 0;
+    private static int _pendingSASFrames = 0;
+    private static int _pendingSASStableFrames = 0;
+    private const int SAS_RESTORE_FRAMES = 180;    // max ~3s at 60fps safety limit
+    private const int SAS_STABLE_THRESHOLD = 30;   // mode must read back correctly for 30 consecutive frames
+
+    // Persistent SAS mode watcher — logs every time Autopilot.Mode changes
+    private static VesselAutopilot.AutopilotMode _lastWatchedSASMode = VesselAutopilot.AutopilotMode.StabilityAssist;
+    private static Guid _lastWatchedSASVesselId = Guid.Empty;
+
     /// <summary>
     /// Properly applies "Control From Here" for any part type.
     /// For docking ports, calls ModuleDockingNode.MakeReferenceTransform() so the
@@ -116,7 +131,7 @@ public partial class FastVesselChanger : MonoBehaviour
     /// before the vessel-level reference is updated.  Without this, the navball
     /// uses the Part's default orientation instead of the docking direction.
     /// For all other parts (command modules, etc.), falls back to
-    /// vessel.SetReferenceTransform(part) which is sufficient.
+    /// vessel.SetReferenceTransform(part) which is sufficient. 
     /// </summary>
     private static void ApplyControlFromHere(Vessel vessel, Part controlPart)
     {
@@ -592,19 +607,16 @@ public partial class FastVesselChanger : MonoBehaviour
                         hullcamActiveVessel.ActionGroups.SetGroup(KSPActionGroup.RCS, true);
                     if (initVS.sasOn && hullcamActiveVessel.Autopilot != null)
                     {
-                        // Enable SAS FIRST — SetMode() silently returns false if Enabled is false
+                        // Enable SAS immediately (this always works)
                         hullcamActiveVessel.ActionGroups.SetGroup(KSPActionGroup.SAS, true);
-                        var savedSasMode = (VesselAutopilot.AutopilotMode)initVS.sasMode;
-                        try
-                        {
-                            if (hullcamActiveVessel.Autopilot.CanSetMode(savedSasMode))
-                                hullcamActiveVessel.Autopilot.SetMode(savedSasMode);
-                            // else: mode unavailable (e.g. no probe core or part missing) — leave at StabilityAssist
-                        }
-                        catch (Exception ex)
-                        {
-                            Debug.LogWarning("[FVC] SAS mode restore failed for mode " + savedSasMode + ": " + ex.Message);
-                        }
+                        // Defer mode restore — CanSetMode depends on SASServiceLevel
+                        // which isn't populated until VesselAutopilot.Start() runs.
+                        _pendingSASRestore = true;
+                        _pendingSASVesselId = hullcamActiveVessel.id;
+                        _pendingSASMode = initVS.sasMode;
+                        _pendingSASFrames = SAS_RESTORE_FRAMES;
+                        _pendingSASStableFrames = 0;
+                        Debug.Log("[FastVesselChanger] Armed SAS deferred restore: mode=" + (VesselAutopilot.AutopilotMode)initVS.sasMode + " for up to " + SAS_RESTORE_FRAMES + " frames");
                     }
                     if (initVS.speedMode >= 0)
                     {
@@ -1025,6 +1037,62 @@ public partial class FastVesselChanger : MonoBehaviour
                     _pendingControlFromHereVesselId = Guid.Empty;
                     if (activeVessel != null)
                         Debug.Log("[FastVesselChanger] CFH restore complete after " + CONTROL_RESTORE_FRAMES + " frames, final refTransformId=" + activeVessel.referenceTransformId);
+                }
+            }
+
+            // SAS mode restore — keep re-applying for the full window.
+            // KSP's autopilot re-init can reset the mode ~0.2-0.4s after scene load,
+            // AFTER the mode initially appears stable. So we fight for the full duration.
+            if (_pendingSASRestore && _pendingSASFrames > 0)
+            {
+                var activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null && activeVessel.id == _pendingSASVesselId && activeVessel.Autopilot != null)
+                {
+                    var mode = (VesselAutopilot.AutopilotMode)_pendingSASMode;
+
+                    // Always force SAS on and set the mode every frame
+                    activeVessel.ActionGroups.SetGroup(KSPActionGroup.SAS, true);
+                    if (activeVessel.Autopilot.CanSetMode(mode))
+                        activeVessel.Autopilot.SetMode(mode);
+
+                    // Track whether mode reads back correctly
+                    if (activeVessel.Autopilot.Mode == mode)
+                        _pendingSASStableFrames++;
+                    else
+                        _pendingSASStableFrames = 0;
+                }
+
+                _pendingSASFrames--;
+                if (_pendingSASFrames <= 0)
+                {
+                    _pendingSASRestore = false;
+                    _pendingSASVesselId = Guid.Empty;
+                    if (activeVessel != null)
+                        Debug.Log("[FastVesselChanger] SAS restore complete after " + SAS_RESTORE_FRAMES + " frames, final mode=" + activeVessel.Autopilot?.Mode
+                            + " (stable for last " + _pendingSASStableFrames + " frames)");
+                }
+            }
+
+            // Persistent SAS mode watcher — detect external resets
+            {
+                var watchVessel = FlightGlobals.ActiveVessel;
+                if (watchVessel != null && watchVessel.Autopilot != null)
+                {
+                    var currentMode = watchVessel.Autopilot.Mode;
+                    if (watchVessel.id != _lastWatchedSASVesselId)
+                    {
+                        // New vessel — reset watcher
+                        _lastWatchedSASVesselId = watchVessel.id;
+                        _lastWatchedSASMode = currentMode;
+                    }
+                    else if (currentMode != _lastWatchedSASMode)
+                    {
+                        Debug.Log("[FastVesselChanger] SAS MODE CHANGED: " + _lastWatchedSASMode + " -> " + currentMode
+                            + " vessel=" + watchVessel.vesselName
+                            + " pendingRestore=" + _pendingSASRestore
+                            + " frame=" + Time.frameCount);
+                        _lastWatchedSASMode = currentMode;
+                    }
                 }
             }
 
@@ -2440,7 +2508,8 @@ public partial class FastVesselChanger : MonoBehaviour
             SyncCurrentHullcamStateToDict();
 
             // Snapshot SAS + RCS for current vessel
-            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0 && !_isDestroying)
+            // Also guard against snapshotting during pending SAS restore
+            if (_instanceVesselId != Guid.Empty && _pendingZoomFramesRemaining <= 0 && !_pendingSASRestore && !_isDestroying)
             {
                 var av = FlightGlobals.ActiveVessel;
                 if (av != null && av.Autopilot != null)
