@@ -107,7 +107,9 @@ public partial class FastVesselChanger : MonoBehaviour
     private static uint _pendingControlFromHere = 0;
     private static Guid _pendingControlFromHereVesselId = Guid.Empty;
     private static int _pendingControlFromHereFrames = 0;
+    private static int _pendingControlFromHereStableFrames = 0;
     private const int CONTROL_RESTORE_FRAMES = 180; // ~3s at 60fps — longer than zoom to outlast LMP syncs
+    private const int CONTROL_RESTORE_STABLE_THRESHOLD = 30;
 
     // Deferred SAS mode restore — VesselAutopilot.CanSetMode() depends on
     // SASServiceLevel which isn't populated until the Autopilot runs Start().
@@ -131,7 +133,7 @@ public partial class FastVesselChanger : MonoBehaviour
     /// before the vessel-level reference is updated.  Without this, the navball
     /// uses the Part's default orientation instead of the docking direction.
     /// For all other parts (command modules, etc.), falls back to
-    /// vessel.SetReferenceTransform(part) which is sufficient. 
+    /// vessel.SetReferenceTransform(part) which is sufficient.
     /// </summary>
     private static void ApplyControlFromHere(Vessel vessel, Part controlPart)
     {
@@ -578,6 +580,7 @@ public partial class FastVesselChanger : MonoBehaviour
                             _pendingControlFromHere = controlFlightId;
                             _pendingControlFromHereVesselId = hullcamActiveVessel.id;
                             _pendingControlFromHereFrames = CONTROL_RESTORE_FRAMES;
+                            _pendingControlFromHereStableFrames = 0;
                             Debug.Log("[FastVesselChanger] Armed CFH re-application for initial load: " + CONTROL_RESTORE_FRAMES + " frames");
                         }
                     }
@@ -911,19 +914,6 @@ public partial class FastVesselChanger : MonoBehaviour
             }
         }
 
-        // Control From Here — uses its own longer countdown (CONTROL_RESTORE_FRAMES)
-        // because LMP continuously syncs referenceTransformId from the server.
-        if (_pendingControlFromHere != 0 && _pendingControlFromHereFrames > 0)
-        {
-            var activeVessel = FlightGlobals.ActiveVessel;
-            if (activeVessel != null && activeVessel.id == _pendingControlFromHereVesselId)
-            {
-                Part controlPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingControlFromHere);
-                if (controlPart != null)
-                    ApplyControlFromHere(activeVessel, controlPart);
-            }
-        }
-
         // Pre-render UI hide: prevents flicker by hiding the HUD before the frame
         // is drawn.  Uses a realtime deadline instead of frame count so slow/modded
         // systems that take longer to reach OnFlightReady are still covered.
@@ -1019,24 +1009,46 @@ public partial class FastVesselChanger : MonoBehaviour
             if (_pendingControlFromHere != 0 && _pendingControlFromHereFrames > 0)
             {
                 var activeVessel = FlightGlobals.ActiveVessel;
+                uint desiredControlRef = _pendingControlFromHere;
+
                 if (activeVessel != null && activeVessel.id == _pendingControlFromHereVesselId)
                 {
-                    Part controlPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == _pendingControlFromHere);
+                    Part controlPart = activeVessel.parts?.FirstOrDefault(p => p.flightID == desiredControlRef);
                     if (controlPart != null)
                     {
-                        ApplyControlFromHere(activeVessel, controlPart);
+                        if (activeVessel.referenceTransformId != desiredControlRef)
+                        {
+                            ApplyControlFromHere(activeVessel, controlPart);
+                            _pendingControlFromHereStableFrames = 0;
+                        }
+
+                        if (activeVessel.referenceTransformId == desiredControlRef)
+                            _pendingControlFromHereStableFrames++;
+                        else
+                            _pendingControlFromHereStableFrames = 0;
+
                         if (_pendingControlFromHereFrames == CONTROL_RESTORE_FRAMES)
-                            Debug.Log("[FastVesselChanger] CFH coroutine: first-frame apply flightID=" + _pendingControlFromHere + " refTransformId=" + activeVessel.referenceTransformId);
+                            Debug.Log("[FastVesselChanger] CFH coroutine: first-frame apply flightID=" + desiredControlRef + " refTransformId=" + activeVessel.referenceTransformId);
                     }
+                    else
+                        _pendingControlFromHereStableFrames = 0;
                 }
+                else
+                    _pendingControlFromHereStableFrames = 0;
 
                 _pendingControlFromHereFrames--;
-                if (_pendingControlFromHereFrames <= 0)
+                if (_pendingControlFromHereStableFrames >= CONTROL_RESTORE_STABLE_THRESHOLD
+                    || _pendingControlFromHereFrames <= 0)
                 {
+                    bool completedByStability = _pendingControlFromHereStableFrames >= CONTROL_RESTORE_STABLE_THRESHOLD;
+                    int stableFramesAtEnd = _pendingControlFromHereStableFrames;
                     _pendingControlFromHere = 0;
                     _pendingControlFromHereVesselId = Guid.Empty;
+                    _pendingControlFromHereFrames = 0;
+                    _pendingControlFromHereStableFrames = 0;
                     if (activeVessel != null)
-                        Debug.Log("[FastVesselChanger] CFH restore complete after " + CONTROL_RESTORE_FRAMES + " frames, final refTransformId=" + activeVessel.referenceTransformId);
+                        Debug.Log("[FastVesselChanger] CFH restore complete (" + (completedByStability ? "stable" : "timeout")
+                            + ") stableFrames=" + stableFramesAtEnd + " final refTransformId=" + activeVessel.referenceTransformId);
                 }
             }
 
@@ -1244,7 +1256,6 @@ public partial class FastVesselChanger : MonoBehaviour
         {
             if (Time.realtimeSinceStartup > _sceneLoadGraceRealtime)
             {
-                _uiHideDeadlineRealtime = 0f;
                 ToggleFlightUI();
             }
         }
@@ -1341,6 +1352,7 @@ public partial class FastVesselChanger : MonoBehaviour
                 BuildCycleList();
             }
             GUILayout.Label(v.vesselName, isActive ? (_activeVesselRowStyle ?? GUI.skin.label) : GUI.skin.label);
+            DrawDayNightDot(v);
             GUILayout.FlexibleSpace();
             GUILayout.Label("[" + v.vesselType + "]", _vesselTypeStyle ?? GUI.skin.label, GUILayout.Width(68));
             DrawAutoLightsButton(v);
@@ -1930,9 +1942,15 @@ public partial class FastVesselChanger : MonoBehaviour
             return;
         }
 
-        // Assert hidden state before triggering the scene reload
+        // Assert hidden state before triggering the scene reload.
+        // Re-arm the deadline so the old-instance OnShowUI_Instance handler
+        // suppresses KSP's internal ShowUI call fired during the FLIGHT→FLIGHT
+        // transition — without this, the static preference flips to visible.
         if (!userPreferredUIVisible)
+        {
+            _uiHideDeadlineRealtime = Time.realtimeSinceStartup + UI_HIDE_DURATION;
             InvokeHideUI();
+        }
 
         // If the destination vessel has hull cam enabled, arm the blackout overlay
         // so OnGUI draws a full-screen black rect from scene-start until the hull cam
@@ -2004,12 +2022,14 @@ public partial class FastVesselChanger : MonoBehaviour
             _pendingControlFromHere = restoreVS.controlRefFlightId;
             _pendingControlFromHereVesselId = v.id;
             _pendingControlFromHereFrames = CONTROL_RESTORE_FRAMES;
+            _pendingControlFromHereStableFrames = 0;
         }
         else
         {
             _pendingControlFromHere = 0;
             _pendingControlFromHereVesselId = Guid.Empty;
             _pendingControlFromHereFrames = 0;
+            _pendingControlFromHereStableFrames = 0;
         }
 
         // Randomize camera rotation rates if enabled

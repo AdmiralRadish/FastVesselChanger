@@ -2,9 +2,7 @@
 //
 // When the active vessel transitions from sunlight to shadow, and auto-lights is
 // enabled for that vessel (default: ON), the mod fires the Light action group.
-// When the vessel exits shadow, the mod turns lights OFF — but ONLY if the mod
-// was the one that turned them on (tracked via _modManagedLightsActive).  If the
-// player manually enabled lights, they are left alone when exiting shadow.
+// When the vessel exits shadow, the mod turns lights OFF.
 //
 // Per-vessel toggle: a small light-bulb icon button (white = ON, dark = OFF) in the vessel list row.
 // Persisted in XML user prefs (FastVesselChanger.xml) inside the player section.
@@ -69,11 +67,11 @@ public partial class FastVesselChanger
             GetOrCreateVesselSettings(vessel.id).lightsManagedByMod = true;
             Debug.Log("[FVC] AutoLights: " + vessel.vesselName + " entered shadow — lights ON");
         }
-        else if (_vesselSettings.TryGetValue(vessel.id, out var exitVS) && exitVS.lightsManagedByMod)
+        else
         {
-            // Exited shadow and the mod was responsible for the lights — turn off.
+            // Exited shadow — auto-lights owns day/night transitions and turns lights off.
             vessel.ActionGroups.SetGroup(KSPActionGroup.Light, false);
-            exitVS.lightsManagedByMod = false;
+            GetOrCreateVesselSettings(vessel.id).lightsManagedByMod = false;
             Debug.Log("[FVC] AutoLights: " + vessel.vesselName + " exited shadow — lights OFF");
         }
     }
@@ -180,11 +178,88 @@ public partial class FastVesselChanger
     // Size 14×14 — not subject to DXT compression so no pow-2 restriction.
     private static Texture2D _lightIconOn;
     private static Texture2D _lightIconOff;
+    private static Texture2D _dayNightDotDay;
+    private static Texture2D _dayNightDotNight;
+    private static readonly Dictionary<Guid, bool> _dayNightDotCache = new Dictionary<Guid, bool>();
+    private static float _dayNightDotCacheNextRefresh = 0f;
 
     private static void EnsureLightIcons()
     {
         if (_lightIconOn  == null) _lightIconOn  = BuildLightIcon(isOn: true);
         if (_lightIconOff == null) _lightIconOff = BuildLightIcon(isOn: false);
+        if (_dayNightDotDay == null) _dayNightDotDay = BuildDayNightDot(isDay: true);
+        if (_dayNightDotNight == null) _dayNightDotNight = BuildDayNightDot(isDay: false);
+    }
+
+    private static Texture2D BuildDayNightDot(bool isDay)
+    {
+        const int S = 10;
+        const float c = (S - 1) * 0.5f;
+        const float r = 3.35f;
+        const float outline = 0.9f;
+
+        Color fill = isDay
+            ? new Color(1f, 1f, 1f, 1f)
+            : new Color(0f, 0f, 0f, 1f);
+        Color border = isDay
+            ? new Color(0f, 0f, 0f, 0.75f)
+            : new Color(1f, 1f, 1f, 0.75f);
+        Color clear = new Color(0f, 0f, 0f, 0f);
+
+        var tex = new Texture2D(S, S, TextureFormat.RGBA32, false);
+        tex.filterMode = FilterMode.Bilinear;
+
+        for (int y = 0; y < S; y++)
+        {
+            for (int x = 0; x < S; x++)
+            {
+                float dx = x - c;
+                float dy = y - c;
+                float d = Mathf.Sqrt(dx * dx + dy * dy);
+
+                if (d <= r)
+                    tex.SetPixel(x, y, fill);
+                else if (d <= r + outline)
+                    tex.SetPixel(x, y, border);
+                else
+                    tex.SetPixel(x, y, clear);
+            }
+        }
+
+        tex.Apply();
+        return tex;
+    }
+
+    private void DrawDayNightDot(Vessel v)
+    {
+        EnsureLightIcons();
+
+        bool inShadow = GetCachedShadowState(v);
+        var icon = inShadow ? _dayNightDotNight : _dayNightDotDay;
+        var tooltip = inShadow
+            ? "Night/Shadow state: NIGHT"
+            : "Night/Shadow state: DAY";
+
+        GUILayout.Label(new GUIContent(icon, tooltip), GUILayout.Width(14), GUILayout.Height(14));
+    }
+
+    private static bool GetCachedShadowState(Vessel vessel)
+    {
+        if (vessel == null) return false;
+
+        if (Time.realtimeSinceStartup >= _dayNightDotCacheNextRefresh)
+        {
+            _dayNightDotCache.Clear();
+            _dayNightDotCacheNextRefresh = Time.realtimeSinceStartup + SHADOW_CHECK_INTERVAL;
+        }
+
+        bool inShadow;
+        if (_dayNightDotCache.TryGetValue(vessel.id, out inShadow))
+            return inShadow;
+
+        inShadow = IsVesselInShadow(vessel);
+        _dayNightDotCache[vessel.id] = inShadow;
+        return inShadow;
     }
 
     /// <summary>
@@ -272,30 +347,36 @@ public partial class FastVesselChanger
         {
             SetVesselAutoLightsEnabled(v.id, newEnabled);
 
+            bool lightsCurrentlyOn = v.ActionGroups[KSPActionGroup.Light];
+            bool inShadowNow = IsVesselInShadow(v);
+            var toggleVS = GetOrCreateVesselSettings(v.id);
+
             if (!newEnabled)
             {
-                // User disabled auto-lights — if the mod had turned them on, turn them back off now.
-                VesselSettings disVS;
-                if (_vesselSettings.TryGetValue(v.id, out disVS) && disVS.lightsManagedByMod)
+                // User disabled auto-lights — force immediate OFF if currently on.
+                if (lightsCurrentlyOn)
                 {
                     v.ActionGroups.SetGroup(KSPActionGroup.Light, false);
-                    disVS.lightsManagedByMod = false;
-                    Debug.Log("[FVC] AutoLights: user disabled auto-lights on " + v.vesselName + " while mod-managed — lights OFF");
+                    Debug.Log("[FVC] AutoLights: user disabled auto-lights on " + v.vesselName + " — lights OFF");
                 }
+
+                toggleVS.lightsManagedByMod = false;
             }
             else
             {
-                // User re-enabled auto-lights — act immediately if the vessel is currently in shadow.
-                bool inShadow = IsVesselInShadow(v);
-                if (inShadow)
+                // User enabled auto-lights — force immediate ON if currently off.
+                if (!lightsCurrentlyOn)
                 {
                     v.ActionGroups.SetGroup(KSPActionGroup.Light, true);
-                    GetOrCreateVesselSettings(v.id).lightsManagedByMod = true;
-                    // Sync the polling state so UpdateAutoLights doesn't treat this as a new transition.
-                    if (v == FlightGlobals.ActiveVessel) _autoLightsPrevInShadow = true;
-                    Debug.Log("[FVC] AutoLights: user enabled auto-lights on " + v.vesselName + " (currently in shadow) — lights ON");
+                    Debug.Log("[FVC] AutoLights: user enabled auto-lights on " + v.vesselName + " — lights ON");
                 }
+
+                // After user-enable, auto-lights owns the next day/night transitions.
+                toggleVS.lightsManagedByMod = true;
             }
+
+            // User toggles intentionally bypass day/night gating. Re-sync transition baseline.
+            if (v == FlightGlobals.ActiveVessel) _autoLightsPrevInShadow = inShadowNow;
 
             SaveUserPrefs();
         }
